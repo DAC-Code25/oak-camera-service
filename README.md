@@ -1,9 +1,13 @@
 # 工控机 OAK 相机 HTTP 服务
 
-更新日期：2026-10-13
+更新日期：2026-10-14
 会话 ID：`01a13477-9b6f-7f43-8a41-5e5b77886c15`
 
-独立 C++17/DepthAI/OpenCV 服务，源自目标机 `/home/nvidia/tenco-oak-probe` 的项目代码。本目录不链接到 Windows Qt 应用；厂商 SDK 从目标机 `/opt/ros/humble` 获取，不复制进仓库。源码首次纳管与原始哈希见 [开发方案](../../docs/develop/OAK相机采集恢复开发方案.md) 和 [诊断记录](../../docs/develop/相机断流排查开发记录.md)。未纳管原工程的 build、PDF、媒体、安装脚本或第三方代码。
+独立 C++17/DepthAI/OpenCV 服务，部署在 Ubuntu/Jetson 工控机，提供视频预览、原生拍照及录像 HTTP API。工作空间中与 `Tenco/`、`src/` 并列，本仓库独立维护服务源码、测试、部署脚本和 systemd 配置；Tenco 上位机保留客户端，本服务不链接到 Windows Qt 应用，也不作为 ROS 包构建。厂商 SDK 从目标机 `/opt/ros/humble` 获取，不复制进仓库。
+
+2026-10-14 从 Tenco 的 `services/oak-camera/` 提取为独立项目，保留采集恢复、最新版清理和原生采集三次服务源码改动历史；导入 main 为 `32918441be25957ff515cc500028644613ca7d60`，与原 Tenco 服务树相同。见 [迁移方案与记录](docs/develop/相机服务独立项目迁移开发方案与记录.md)。统一约束从 [AGENTS](AGENTS.md) 进入，跨项目状态见 [状态快照](docs/workspace/docs/当前状态.md)。工控机现有源码/构建仍在 `/home/nvidia/tenco-oak-probe-recovery-v1`，运行 `/opt/tenco/bin/oak_camera_service`；此次本地仓库拆分没有同步或重新部署线上服务。`Capture/`、SDK、构建产物和凭据不进入版本管理。
+
+原服务来自目标机 `/home/nvidia/tenco-oak-probe`（已按清理约定删除）。历史记录描述当时的仓库归属，后续开发以本项目为准。源码首次纳管与原始哈希见 [开发方案](docs/history/OAK相机采集恢复开发方案.md) 和 [诊断记录](docs/history/相机断流排查开发记录.md)。未纳管原工程的 build、PDF、媒体、安装脚本或第三方代码。
 
 在 Ubuntu 22.04 / Jetson ARM64（已有 DepthAI 2.31.1、OpenCV 4.8）构建：
 
@@ -23,7 +27,7 @@ ctest --test-dir build --output-on-failure
 
 `--capture-jpeg-quality` 控制照片质量（1～100），`--recording-crf` 控制录像质量（0～51，越小文件越大）。默认两个保存目录均为当前工作目录下Capture；目标机必须安装本目录的 `systemd/20-native-capture.conf` 到 `/etc/systemd/system/tenco-oak-camera.service.d/20-native-capture.conf`，使开机启动和手动重启使用绝对路径 `/home/nvidia/tenco-oak-probe-recovery-v1/Capture`。drop-in同时清除旧unit宽泛pkill；systemd停止自己的cgroup。既有业务媒体不迁移/删除。
 
-构建依赖新增pkg-config、libavformat/libavcodec/libavutil开发库及含libx264的FFmpeg；测试需要ffmpeg/ffprobe。原生MP4在Orin Nano低照度实测约4～5FPS，预览15FPS是配置目标，不等于原生录像帧率；容量/负载随场景变化，完整尺寸优先。具体实测/上线状态见 [原生采集记录](../../docs/develop/OAK原生拍照录像开发记录.md)。原生硬件JPEG受宽度32倍数限制，不使用4K裁剪或预览放大冒充原生。
+构建依赖新增pkg-config、libavformat/libavcodec/libavutil开发库及含libx264的FFmpeg；测试需要ffmpeg/ffprobe。原生MP4在Orin Nano低照度实测约4～5FPS，预览15FPS是配置目标，不等于原生录像帧率；容量/负载随场景变化，完整尺寸优先。具体实测/上线状态见 [原生采集记录](docs/history/OAK原生拍照录像开发记录.md)。原生硬件JPEG受宽度32倍数限制，不使用4K裁剪或预览放大冒充原生。
 
 status新增sensorName/nativeWidth/nativeHeight、captureJpegQuality/recordingCrf、recordingCodec/recordingContainer、nativeFrameId/lastNativeFrameAgeMs、recordingFrames/recordingDroppedFrames/lastRecordingError；recording仅在编码线程仍活动时为true。编码线程仅持有媒体状态短锁，状态/MJPEG不等待磁盘封装。正常停止会等待有界队列编码并封装，分片减少异常退出对整段文件的影响，不承诺断电零丢失。
 
@@ -33,4 +37,4 @@ DepthAI Device 的打开/销毁使用 SDK 自身超时，无法保证物理设�
 
 部署前先查 `systemctl cat tenco-oak-camera.service`，确认 ExecStart 指向 `/opt/tenco/bin/oak_camera_service`；执行 `scripts/deploy_verified_service.sh` 时传入经过验证的二进制和期望 SHA256，在已授权维护窗口通过sudo运行。脚本拒绝录像中的切换，暂存旧程序、原子替换并重启相机服务；失败先恢复旧程序。连续三次健康且frameId增长、安装哈希一致后，删除本次临时旧程序，成功回退后也删除重复副本，只保留当前有效版本。不会安装依赖、pkill其他程序、改当前systemd/Lua/车辆控制或删除业务媒体。
 
-2026-10-13用户要求清理长期旧版本/备份；原 `/home/nvidia/tenco-oak-probe` 与上线旧程序备份进入清理范围，最新版源码/Release仍在 `/home/nvidia/tenco-oak-probe-recovery-v1`。当前恢复方法以受控源码重新构建/部署为准，不能使用已删除备份。实际清单与验证见 [清理记录](../../docs/develop/相机旧版本与备份清理开发记录.md)。
+2026-10-13用户要求清理长期旧版本/备份；原 `/home/nvidia/tenco-oak-probe` 与上线旧程序备份进入清理范围，最新版源码/Release仍在 `/home/nvidia/tenco-oak-probe-recovery-v1`。当前恢复方法以受控源码重新构建/部署为准，不能使用已删除备份。实际清单与验证见 [清理记录](docs/history/相机旧版本与备份清理开发记录.md)。
