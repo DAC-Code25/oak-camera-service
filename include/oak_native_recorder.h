@@ -12,6 +12,7 @@ struct OakRecordingStats {
     std::uint64_t frames = 0;
     std::uint64_t dropped = 0;
     std::string error;
+    double actualFps = 0;
 };
 
 // The worker exclusively owns codec and muxer state. submit never encodes or waits for disk.

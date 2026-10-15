@@ -150,7 +150,8 @@ struct OakNativeRecorder::Impl {
                 const auto pts = std::max(previous + 1,
                     std::chrono::duration_cast<std::chrono::milliseconds>(item.timestamp - first).count());
                 session.write(*item.yuv, pts); previous = pts;
-                { std::lock_guard<std::mutex> lock(mutex); ++stats.frames; }
+                { std::lock_guard<std::mutex> lock(mutex); ++stats.frames;
+                  stats.actualFps = stats.frames / (pts/1000.0 + 1.0/fps); }
             }
         } catch(const std::exception& e) { error = e.what(); }
         try { session.finish(); } catch(const std::exception& e) { if(error.empty()) error = e.what(); }

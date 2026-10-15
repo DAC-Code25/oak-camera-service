@@ -35,7 +35,9 @@ public:
         if(control.mode == 2) return {};
         cv::Mat yuv;
         cv::cvtColor(cv::Mat(64, 96, CV_8UC3, cv::Scalar(0, 150, 0)), yuv, cv::COLOR_BGR2YUV_I420);
-        return {cv::Mat(32, 48, CV_8UC3, cv::Scalar(0, 150, 0)).clone(), std::make_shared<const std::vector<std::uint8_t>>(yuv.data, yuv.data + yuv.total()), std::chrono::steady_clock::now()};
+        const auto bytes = std::make_shared<const std::vector<std::uint8_t>>(yuv.data, yuv.data + yuv.total());
+        const auto now = std::chrono::steady_clock::now();
+        return {cv::Mat(32, 48, CV_8UC3, cv::Scalar(0, 150, 0)).clone(), bytes, now, bytes, now};
     }
     OakCaptureInfo info() const override { return {"test-native", 96, 64}; }
     std::string deviceId() const override { return "controlled-test"; }
@@ -48,6 +50,8 @@ int main() {
         ("oak-recovery-test-" + std::to_string(getpid()));
     try {
         OakCameraConfig config;
+        config.previewWidth = 48; config.previewHeight = 32;
+        config.media.recording = {96,64,30};
         config.snapshotDir = directory / "photos";
         config.recordingDir = directory / "records";
         config.frameFreshnessMs = 80;
