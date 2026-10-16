@@ -2,6 +2,7 @@
 
 #include "oak_capture_source.h"
 #include "oak_native_recorder.h"
+#include "oak_media_settings.h"
 #include <opencv2/opencv.hpp>
 
 #include <atomic>
@@ -22,6 +23,7 @@ struct OakCameraConfig {
     int previewHeight = 540;
     float previewFps = 15.0f;
     int jpegQuality = 70;
+    bool optimizePreviewJpeg = true;
     int captureJpegQuality = 90;
     int recordingCrf = 23;
     bool lowLatencyProfile = true;
@@ -32,6 +34,8 @@ struct OakCameraConfig {
     std::filesystem::path snapshotDir = "Capture";
     std::filesystem::path recordingDir = "Capture";
     std::string mjpegBoundary = "tenco-oak-boundary";
+    OakMediaSettings media;
+    std::filesystem::path settingsFile;
 };
 
 struct OakStatus {
@@ -45,6 +49,7 @@ struct OakStatus {
     int previewHeight = 0;
     float previewFps = 0.0f;
     int jpegQuality = 0;
+    bool previewJpegOptimized = false;
     std::string snapshotDir;
     std::string recordingDir;
     std::string lastPhotoPath;
@@ -65,6 +70,7 @@ struct OakStatus {
     std::uint64_t recordingFrames = 0;
     std::uint64_t recordingDroppedFrames = 0;
     std::string lastRecordingError;
+    double recordingActualFps = 0;
 };
 
 class OakCameraDevice {
@@ -82,6 +88,10 @@ class OakCameraDevice {
     OakStatus savePhoto();
     OakStatus startRecording();
     OakStatus stopRecording();
+    Json::Value settings() const;
+    Json::Value capabilities() const;
+    // Persistence and concurrency checks complete before a pending result is returned.
+    Json::Value updateSettings(const Json::Value& request);
 
     bool waitForNextJpeg(std::uint64_t afterFrameId, std::uint64_t& outFrameId, std::vector<std::uint8_t>& outJpeg, std::chrono::milliseconds timeout) const;
     std::optional<std::vector<std::uint8_t>> latestJpeg() const;
@@ -98,6 +108,13 @@ class OakCameraDevice {
     OakCameraConfig config_;
     OakCaptureFactory factory_;
     std::mutex lifecycleMutex_;
+    OakMediaSettings desiredSettings_, activeSettings_;
+    std::uint64_t settingsRevision_ = 1, activeRevision_ = 0;
+    std::uint64_t persistedRevision_ = 0;
+    bool reconfigure_ = false, hasActiveSettings_ = false;
+    std::optional<OakMediaSettings> rollbackSettings_;
+    std::string applyState_ = "pending", settingsError_;
+    Json::Value settingsLocked() const;
 
     mutable std::mutex mutex_;
     mutable std::mutex controlMutex_;
@@ -120,6 +137,7 @@ class OakCameraDevice {
     std::vector<std::uint8_t> latestJpeg_;
     std::shared_ptr<const std::vector<std::uint8_t>> latestNativeYuv_;
     std::chrono::steady_clock::time_point lastNativeFrameTime_{};
+    std::chrono::steady_clock::time_point lastRecordingFrameTime_{};
     std::uint64_t nativeFrameId_ = 0;
     OakCaptureInfo captureInfo_;
     OakNativeRecorder writer_;

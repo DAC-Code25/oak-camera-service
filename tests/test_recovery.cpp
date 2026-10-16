@@ -35,7 +35,9 @@ public:
         if(control.mode == 2) return {};
         cv::Mat yuv;
         cv::cvtColor(cv::Mat(64, 96, CV_8UC3, cv::Scalar(0, 150, 0)), yuv, cv::COLOR_BGR2YUV_I420);
-        return {cv::Mat(32, 48, CV_8UC3, cv::Scalar(0, 150, 0)).clone(), std::make_shared<const std::vector<std::uint8_t>>(yuv.data, yuv.data + yuv.total()), std::chrono::steady_clock::now()};
+        const auto bytes = std::make_shared<const std::vector<std::uint8_t>>(yuv.data, yuv.data + yuv.total());
+        const auto now = std::chrono::steady_clock::now();
+        return {cv::Mat(32, 48, CV_8UC3, cv::Scalar(0, 150, 0)).clone(), bytes, now, bytes, now};
     }
     OakCaptureInfo info() const override { return {"test-native", 96, 64}; }
     std::string deviceId() const override { return "controlled-test"; }
@@ -48,6 +50,8 @@ int main() {
         ("oak-recovery-test-" + std::to_string(getpid()));
     try {
         OakCameraConfig config;
+        config.previewWidth = 48; config.previewHeight = 32;
+        config.media.recording = {96,64,30};
         config.snapshotDir = directory / "photos";
         config.recordingDir = directory / "records";
         config.frameFreshnessMs = 80;
@@ -62,6 +66,15 @@ int main() {
         std::vector<std::uint8_t> jpeg;
         require(camera.waitForNextJpeg(0, id, jpeg, std::chrono::milliseconds(0)), "initial JPEG missing");
         require(!jpeg.empty() && id > 0, "JPEG/frame ID invalid");
+        // Production preview optimization changes entropy coding only. Decode
+        // must match the original encoder at the same quality and input pixels.
+        std::vector<std::uint8_t> original;
+        cv::imencode(".jpg", cv::Mat(32, 48, CV_8UC3, cv::Scalar(0, 150, 0)), original,
+                     {cv::IMWRITE_JPEG_QUALITY, config.jpegQuality});
+        require(jpeg.size() < original.size(), "optimized preview did not reduce fixture bytes");
+        require(cv::norm(cv::imdecode(jpeg, cv::IMREAD_COLOR), cv::imdecode(original, cv::IMREAD_COLOR),
+                         cv::NORM_INF) == 0, "preview entropy optimization changed decoded pixels");
+        require(camera.status().previewJpegOptimized, "preview optimization not diagnosed");
         require(camera.startRecording().success, "recording did not start");
         control.mode = 1;
         waitFor([&] { return camera.status().reconnectCount > 0; }, "fault did not trigger retry");
@@ -86,6 +99,14 @@ int main() {
         camera.start();
         waitFor([&] { return camera.status().cameraConnected; }, "same object restart failed");
         camera.stop();
+        config.optimizePreviewJpeg = false;
+        OakCameraDevice unoptimized(config, [&] { return std::make_unique<ControlledSource>(control); });
+        unoptimized.start();
+        waitFor([&] { return unoptimized.status().cameraConnected; }, "unoptimized preview missing");
+        const auto unoptimizedJpeg = unoptimized.latestJpeg();
+        require(unoptimizedJpeg && *unoptimizedJpeg == original, "preview encoder fallback changed");
+        require(!unoptimized.status().previewJpegOptimized, "preview fallback not diagnosed");
+        unoptimized.stop();
         control.mode = 3;
         config.reconnectIntervalMs = 2000;
         config.reconnectMaxIntervalMs = 2000;

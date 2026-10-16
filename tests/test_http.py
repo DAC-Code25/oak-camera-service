@@ -31,6 +31,7 @@ with tempfile.TemporaryDirectory(prefix="oak-http-test-") as directory:
         port = port_probe.getsockname()[1]
     env = dict(os.environ, OAK_TEST_STATE_FILE=str(state))
     args = [sys.argv[1], "--bind", "127.0.0.1", "--port", str(port),
+            "--width", "48", "--height", "32", "--record-width", "96", "--record-height", "64",
             "--snapshot-dir", directory + "/photos", "--recording-dir", directory + "/records",
             "--frame-freshness-ms", "100", "--no-frame-timeout-ms", "200",
             "--reconnect-interval-ms", "30", "--reconnect-max-interval-ms", "120"]
@@ -55,6 +56,7 @@ with tempfile.TemporaryDirectory(prefix="oak-http-test-") as directory:
         assert code == 503 and not body["cameraConnected"]
         state.write_text("healthy")
         wait_for(lambda: status()["cameraConnected"], "HTTP capture did not become healthy")
+        assert status()["previewJpegOptimized"] is True
         duplicate = subprocess.run(args, env=env, capture_output=True, timeout=3)
         assert duplicate.returncode != 0 and b"bind() failed" in duplicate.stderr
         assert b"capture connected" not in duplicate.stdout
@@ -119,6 +121,12 @@ with tempfile.TemporaryDirectory(prefix="oak-http-test-") as directory:
         state.write_text("healthy")
         wait_for(lambda: status()["cameraConnected"] and status()["lastNativeFrameAgeMs"] >= 0,
                  "native-only stall did not recover")
+        retries = status()["reconnectCount"]
+        state.write_text("recording-stall")
+        wait_for(lambda: status()["reconnectCount"] > retries and "recording source stalled" in status()["lastCaptureError"],
+                 "recording-only stall did not rebuild camera")
+        state.write_text("healthy")
+        wait_for(lambda: status()["cameraConnected"], "recording-only stall did not recover")
         # Partial requests cannot block shutdown or create unbounded workers.
         for _ in range(18):
             sock = socket.create_connection(("127.0.0.1", port), timeout=2)

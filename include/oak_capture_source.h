@@ -14,12 +14,15 @@ struct OakCaptureFrame {
     cv::Mat preview;
     std::shared_ptr<const std::vector<std::uint8_t>> nativeYuv;
     std::chrono::steady_clock::time_point capturedAt{};
+    std::shared_ptr<const std::vector<std::uint8_t>> recordingYuv;
+    std::chrono::steady_clock::time_point recordingAt{};
 };
 
 struct OakCaptureInfo {
     std::string sensorName;
     int nativeWidth = 0;
     int nativeHeight = 0;
+    double minFps = 1.42, maxFps = 30;
 };
 
 // A source belongs exclusively to the capture thread, including destruction.

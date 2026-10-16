@@ -20,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cctype>
 
 namespace {
 
@@ -39,6 +40,7 @@ void signalHandler(int) {
 struct HttpRequest {
     std::string method;
     std::string path;
+    std::string body;
 };
 
 HttpRequest parseRequestLine(const std::string& requestText) {
@@ -49,11 +51,11 @@ HttpRequest parseRequestLine(const std::string& requestText) {
     return request;
 }
 
-bool sendAll(int fd, const void* data, std::size_t size) {
+bool sendAll(int fd, const void* data, std::size_t size, int flags = 0) {
     const auto* ptr = static_cast<const char*>(data);
     std::size_t sent = 0;
     while(sent < size) {
-        const auto written = ::send(fd, ptr + sent, size - sent, MSG_NOSIGNAL);
+        const auto written = ::send(fd, ptr + sent, size - sent, MSG_NOSIGNAL | flags);
         if(written < 0 && errno == EINTR) continue;
         if(written <= 0) {
             return false;
@@ -103,10 +105,13 @@ void handleMjpegStream(int fd, OakCameraDevice& camera, const OakCameraConfig& c
                    << "Content-Type: image/jpeg\r\n"
                    << "Content-Length: " << jpeg.size() << "\r\n\r\n";
         const auto partText = partHeader.str();
-        if(!sendAll(fd, partText.data(), partText.size())) {
+        // Flush once the whole multipart frame has been submitted. MSG_MORE
+        // avoids separate tiny TCP packets for the header and CRLF without
+        // buffering a second JPEG or delaying the next frame.
+        if(!sendAll(fd, partText.data(), partText.size(), MSG_MORE)) {
             break;
         }
-        if(!sendAll(fd, jpeg.data(), jpeg.size())) {
+        if(!sendAll(fd, jpeg.data(), jpeg.size(), MSG_MORE)) {
             break;
         }
         if(!sendAll(fd, "\r\n", 2)) {
@@ -124,18 +129,52 @@ void handleMjpegStream(int fd, OakCameraDevice& camera, const OakCameraConfig& c
 }
 
 void handleClient(int fd, OakCameraDevice& camera, const OakCameraConfig& config) {
+    try {
     std::string requestBuffer;
-    requestBuffer.resize(8192);
-    const auto bytes = ::recv(fd, requestBuffer.data(), requestBuffer.size() - 1, 0);
-    if(bytes <= 0) {
-        return;
+    char chunk[4096]; std::size_t end;
+    while((end = requestBuffer.find("\r\n\r\n")) == std::string::npos) {
+        const auto n = ::recv(fd, chunk, sizeof(chunk), 0);
+        if(n <= 0) return;
+        requestBuffer.append(chunk, n);
+        if(requestBuffer.size() > 24576) throw std::invalid_argument("HTTP request too large");
     }
-    requestBuffer.resize(static_cast<std::size_t>(bytes));
-
-    const auto request = parseRequestLine(requestBuffer);
+    if(end > 8192) throw std::invalid_argument("HTTP header too large");
+    auto request = parseRequestLine(requestBuffer);
+    std::size_t length = 0; bool hasLength = false;
+    std::istringstream headers(requestBuffer.substr(0,end)); std::string line; std::getline(headers,line);
+    while(std::getline(headers,line)) {
+        const auto colon = line.find(':'); if(colon == std::string::npos) continue;
+        auto name = line.substr(0,colon);
+        std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return std::tolower(c);});
+        if(name == "transfer-encoding") throw std::invalid_argument("chunked HTTP bodies are not supported");
+        if(name == "content-length") {
+            if(hasLength) throw std::invalid_argument("duplicate Content-Length");
+            auto value = line.substr(colon+1); value.erase(0,value.find_first_not_of(" \t"));
+            value.erase(value.find_last_not_of(" \t\r")+1);
+            if(value.empty() || value.find_first_not_of("0123456789") != std::string::npos || value.size()>6)
+                throw std::invalid_argument("invalid Content-Length");
+            length = std::stoul(value); hasLength = true;
+            if(length > 16384) throw std::invalid_argument("HTTP body exceeds 16 KiB");
+        }
+    }
+    while(requestBuffer.size()-end-4 < length) {
+        const auto n = ::recv(fd,chunk,std::min(sizeof(chunk),length-(requestBuffer.size()-end-4)),0);
+        if(n <= 0) throw std::invalid_argument("incomplete HTTP body");
+        requestBuffer.append(chunk,n);
+    }
+    request.body = requestBuffer.substr(end+4,length);
     if(request.method == "GET" && request.path == "/camera/status") {
         const auto status = camera.status();
-        sendTextResponse(fd, 200, "OK", "application/json", makeJsonResponse(camera, status));
+        auto v = oakParseJson(makeJsonResponse(camera, status)); v["mediaConfiguration"] = camera.settings();
+        sendTextResponse(fd, 200, "OK", "application/json", oakJsonText(v));
+    } else if(request.method == "GET" && request.path == "/camera/capabilities") {
+        sendTextResponse(fd,200,"OK","application/json",oakJsonText(camera.capabilities()));
+    } else if(request.method == "GET" && request.path == "/camera/settings") {
+        sendTextResponse(fd,200,"OK","application/json",oakJsonText(camera.settings()));
+    } else if(request.method == "PUT" && request.path == "/camera/settings") {
+        const auto result = camera.updateSettings(oakParseJson(request.body));
+        const bool pending = result["applyState"] == "pending";
+        sendTextResponse(fd,pending?202:200,pending?"Accepted":"OK","application/json",oakJsonText(result));
     } else if(request.method == "POST" && request.path == "/camera/photo") {
         const auto status = camera.savePhoto();
         sendTextResponse(fd, status.success ? 200 : 500, status.success ? "OK" : "Internal Server Error", "application/json", makeJsonResponse(camera, status));
@@ -150,7 +189,16 @@ void handleClient(int fd, OakCameraDevice& camera, const OakCameraConfig& config
     } else {
         sendTextResponse(fd, 404, "Not Found", "application/json", "{\"success\":false,\"message\":\"not found\",\"path\":\"\",\"cameraConnected\":false,\"recording\":false}");
     }
-
+    } catch(const std::invalid_argument& e) {
+        Json::Value v; v["success"] = false; v["message"] = e.what();
+        sendTextResponse(fd,400,"Bad Request","application/json",oakJsonText(v));
+    } catch(const std::logic_error& e) {
+        Json::Value v; v["success"] = false; v["message"] = e.what();
+        sendTextResponse(fd,409,"Conflict","application/json",oakJsonText(v));
+    } catch(const std::exception& e) {
+        Json::Value v; v["success"] = false; v["message"] = e.what();
+        sendTextResponse(fd,500,"Internal Server Error","application/json",oakJsonText(v));
+    }
 }
 
 OakCameraConfig parseConfig(int argc, char** argv) {
@@ -190,10 +238,24 @@ OakCameraConfig parseConfig(int argc, char** argv) {
             config.previewWidth = integer(arg);
         } else if(arg == "--height") {
             config.previewHeight = integer(arg);
+        } else if(arg == "--settings-file") {
+            config.settingsFile = requireValue(arg);
+        } else if(arg == "--sensor-fps") {
+            config.media.sensorFps = real(arg);
+        } else if(arg == "--record-width") {
+            config.media.recording.width = integer(arg);
+        } else if(arg == "--record-height") {
+            config.media.recording.height = integer(arg);
+        } else if(arg == "--record-fps") {
+            config.media.recording.fps = real(arg);
+        } else if(arg == "--photo-fps") {
+            config.media.photo.fps = real(arg);
         } else if(arg == "--fps") {
             config.previewFps = real(arg);
         } else if(arg == "--jpeg-quality") {
             config.jpegQuality = integer(arg);
+        } else if(arg == "--disable-preview-jpeg-optimization") {
+            config.optimizePreviewJpeg = false;
         } else if(arg == "--capture-jpeg-quality") {
             config.captureJpegQuality = integer(arg);
         } else if(arg == "--recording-crf") {
@@ -209,6 +271,8 @@ OakCameraConfig parseConfig(int argc, char** argv) {
         } else if(arg == "--disable-low-latency-profile") {
             config.lowLatencyProfile = false;
         } else if(arg == "--help" || arg == "-h") {
+            std::cout << "Preview lossless entropy optimization: enabled; use --disable-preview-jpeg-optimization to disable.\n";
+            std::cout << "Media settings: [--settings-file FILE] [--sensor-fps FPS] [--record-width W] [--record-height H] [--record-fps FPS] [--photo-fps FPS]. Runtime: GET /camera/capabilities, GET/PUT /camera/settings.\n";
             std::cout << "Usage: oak_camera_service [--bind ADDR] [--port PORT] [--snapshot-dir DIR] [--recording-dir DIR] [--width W] [--height H] [--fps FPS] [--jpeg-quality N] [--capture-jpeg-quality N] [--recording-crf N] [--disable-low-latency-profile] [--frame-freshness-ms N] [--no-frame-timeout-ms N] [--reconnect-interval-ms N] [--reconnect-max-interval-ms N]\n";
             std::exit(0);
         } else {
