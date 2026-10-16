@@ -51,11 +51,11 @@ HttpRequest parseRequestLine(const std::string& requestText) {
     return request;
 }
 
-bool sendAll(int fd, const void* data, std::size_t size) {
+bool sendAll(int fd, const void* data, std::size_t size, int flags = 0) {
     const auto* ptr = static_cast<const char*>(data);
     std::size_t sent = 0;
     while(sent < size) {
-        const auto written = ::send(fd, ptr + sent, size - sent, MSG_NOSIGNAL);
+        const auto written = ::send(fd, ptr + sent, size - sent, MSG_NOSIGNAL | flags);
         if(written < 0 && errno == EINTR) continue;
         if(written <= 0) {
             return false;
@@ -105,10 +105,13 @@ void handleMjpegStream(int fd, OakCameraDevice& camera, const OakCameraConfig& c
                    << "Content-Type: image/jpeg\r\n"
                    << "Content-Length: " << jpeg.size() << "\r\n\r\n";
         const auto partText = partHeader.str();
-        if(!sendAll(fd, partText.data(), partText.size())) {
+        // Flush once the whole multipart frame has been submitted. MSG_MORE
+        // avoids separate tiny TCP packets for the header and CRLF without
+        // buffering a second JPEG or delaying the next frame.
+        if(!sendAll(fd, partText.data(), partText.size(), MSG_MORE)) {
             break;
         }
-        if(!sendAll(fd, jpeg.data(), jpeg.size())) {
+        if(!sendAll(fd, jpeg.data(), jpeg.size(), MSG_MORE)) {
             break;
         }
         if(!sendAll(fd, "\r\n", 2)) {
@@ -251,6 +254,8 @@ OakCameraConfig parseConfig(int argc, char** argv) {
             config.previewFps = real(arg);
         } else if(arg == "--jpeg-quality") {
             config.jpegQuality = integer(arg);
+        } else if(arg == "--disable-preview-jpeg-optimization") {
+            config.optimizePreviewJpeg = false;
         } else if(arg == "--capture-jpeg-quality") {
             config.captureJpegQuality = integer(arg);
         } else if(arg == "--recording-crf") {
@@ -266,6 +271,7 @@ OakCameraConfig parseConfig(int argc, char** argv) {
         } else if(arg == "--disable-low-latency-profile") {
             config.lowLatencyProfile = false;
         } else if(arg == "--help" || arg == "-h") {
+            std::cout << "Preview lossless entropy optimization: enabled; use --disable-preview-jpeg-optimization to disable.\n";
             std::cout << "Media settings: [--settings-file FILE] [--sensor-fps FPS] [--record-width W] [--record-height H] [--record-fps FPS] [--photo-fps FPS]. Runtime: GET /camera/capabilities, GET/PUT /camera/settings.\n";
             std::cout << "Usage: oak_camera_service [--bind ADDR] [--port PORT] [--snapshot-dir DIR] [--recording-dir DIR] [--width W] [--height H] [--fps FPS] [--jpeg-quality N] [--capture-jpeg-quality N] [--recording-crf N] [--disable-low-latency-profile] [--frame-freshness-ms N] [--no-frame-timeout-ms N] [--reconnect-interval-ms N] [--reconnect-max-interval-ms N]\n";
             std::exit(0);

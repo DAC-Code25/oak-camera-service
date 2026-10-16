@@ -467,7 +467,8 @@ std::string OakCameraDevice::makeTimestamp() {
 
 std::vector<std::uint8_t> OakCameraDevice::encodeJpeg(const cv::Mat& frame) const {
     std::vector<std::uint8_t> encoded;
-    if(!cv::imencode(".jpg", frame, encoded, {cv::IMWRITE_JPEG_QUALITY, config_.jpegQuality})) {
+    if(!cv::imencode(".jpg", frame, encoded, {cv::IMWRITE_JPEG_QUALITY, config_.jpegQuality,
+                                           cv::IMWRITE_JPEG_OPTIMIZE, config_.optimizePreviewJpeg ? 1 : 0})) {
         return {};
     }
     return encoded;
@@ -501,6 +502,7 @@ OakStatus OakCameraDevice::currentStatusLocked() const {
     status.previewHeight = activeSettings_.preview.height;
     status.previewFps = activeSettings_.preview.fps;
     status.jpegQuality = config_.jpegQuality;
+    status.previewJpegOptimized = config_.optimizePreviewJpeg;
     status.snapshotDir = config_.snapshotDir.string();
     status.recordingDir = config_.recordingDir.string();
     status.lastPhotoPath = lastPhotoPath_;
@@ -555,6 +557,7 @@ std::string oakStatusToJson(const OakStatus& status) {
         << "\"previewHeight\":" << status.previewHeight << ","
         << "\"previewFps\":" << status.previewFps << ","
         << "\"jpegQuality\":" << status.jpegQuality << ","
+        << "\"previewJpegOptimized\":" << (status.previewJpegOptimized ? "true" : "false") << ","
         << "\"snapshotDir\":\"" << oakEscapeJson(status.snapshotDir) << "\","
         << "\"recordingDir\":\"" << oakEscapeJson(status.recordingDir) << "\","
         << "\"lastPhotoPath\":\"" << oakEscapeJson(status.lastPhotoPath) << "\","

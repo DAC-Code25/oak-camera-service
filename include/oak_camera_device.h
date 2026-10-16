@@ -23,6 +23,7 @@ struct OakCameraConfig {
     int previewHeight = 540;
     float previewFps = 15.0f;
     int jpegQuality = 70;
+    bool optimizePreviewJpeg = true;
     int captureJpegQuality = 90;
     int recordingCrf = 23;
     bool lowLatencyProfile = true;
@@ -48,6 +49,7 @@ struct OakStatus {
     int previewHeight = 0;
     float previewFps = 0.0f;
     int jpegQuality = 0;
+    bool previewJpegOptimized = false;
     std::string snapshotDir;
     std::string recordingDir;
     std::string lastPhotoPath;

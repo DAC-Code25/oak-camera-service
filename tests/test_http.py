@@ -56,6 +56,7 @@ with tempfile.TemporaryDirectory(prefix="oak-http-test-") as directory:
         assert code == 503 and not body["cameraConnected"]
         state.write_text("healthy")
         wait_for(lambda: status()["cameraConnected"], "HTTP capture did not become healthy")
+        assert status()["previewJpegOptimized"] is True
         duplicate = subprocess.run(args, env=env, capture_output=True, timeout=3)
         assert duplicate.returncode != 0 and b"bind() failed" in duplicate.stderr
         assert b"capture connected" not in duplicate.stdout

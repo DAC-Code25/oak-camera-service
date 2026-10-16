@@ -1,6 +1,6 @@
 # 工控机 OAK 相机 HTTP 服务
 
-更新日期：2026-10-15
+更新日期：2026-10-16
 会话 ID：`01a13477-9b6f-7f43-8a41-5e5b77886c15`
 
 独立 C++17/DepthAI/OpenCV 服务，部署在 Ubuntu/Jetson 工控机，提供原生输入、可配置预览/照片/录像 HTTP API。工作空间中与 `Tenco/`、`src/` 并列，本仓库独立维护服务源码、测试、部署脚本和 systemd 配置；Tenco 上位机保留客户端，本服务不链接到 Windows Qt 应用，也不作为 ROS 包构建。厂商 SDK 从目标机 `/opt/ros/humble` 获取，不复制进仓库。
@@ -24,6 +24,8 @@ ctest --test-dir build --output-on-failure
 兼容接口：`GET /camera/status`、`GET /camera/stream.mjpeg`、`POST /camera/photo`、`POST /camera/record/start`、`POST /camera/record/stop`。status 的原字段保留；新增 `frameId`（重连不倒退）、`lastFrameAgeMs`（无帧 -1）、`reconnectCount`（累计采集失败）、`lastCaptureError`（恢复后仍保留最近故障）。健康状态要求收到合法新帧，使用单调时钟；未连接或帧过期的流返回 503，不发旧缓存。
 
 默认画面保持 960×540@15、JPEG 70。采集连续 5 秒无合法新帧则重建；帧超过 1 秒即不作为正常图像提供；失败退避 1、2、4、8、10 秒，持续健康 5 秒后复位退避。失败关闭当前录像，恢复后不会自动续录。
+
+NET-20261016-01候选新增预览JPEG优化Huffman表，默认启用；status.previewJpegOptimized表示该编码选项，`--disable-preview-jpeg-optimization`恢复旧预览编码。不降低尺寸/FPS/质量参数，不改照片/录像；multipart发送归并减少小发送。相同现场输入基准减少约4%，不等于已上线带宽降幅；当前部署阶段、候选哈希、CPU代价与回退见[开发记录](docs/develop/无线预览传输优化开发记录.md)。
 
 当前默认：IMX378原生4056×3040@30输入；预览960×540@15、照片原生JPEG90/照片源2FPS、录像1280×720@30目标/H.264 yuv420p MP4。设备端选帧与缩放降低USB/CPU负载，尺寸比例不一致时完整画面补黑边。原生12MP录像可选但不保证15FPS；默认低分辨率档位通过真实文件FPS与解码验收。使用真实时间戳，不填重复帧。有界3帧编码队列、CRF23、4线程保持，队列满丢最旧帧并统计。原生照片源、录像源和预览5秒无新帧均重建，录像不自动续录；低FPS新鲜度按至少1.5个输出周期放宽。
 
