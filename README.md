@@ -1,15 +1,12 @@
 # 工控机 OAK 相机 HTTP 服务
 
-更新日期：2026-10-16
-会话 ID：`01a13477-9b6f-7f43-8a41-5e5b77886c15`
+独立 C++17/DepthAI/OpenCV/FFmpeg 服务，在 Ubuntu/Jetson 提供预览、照片、录像及媒体参数 HTTP API。与 `Tenco/`、`src/` 并列，不链接到 Windows Qt 应用，不作为 ROS 包构建。厂商 SDK 使用目标机 `/opt/ros/humble` 已有安装。
 
-独立 C++17/DepthAI/OpenCV 服务，部署在 Ubuntu/Jetson 工控机，提供原生输入、可配置预览/照片/录像 HTTP API。工作空间中与 `Tenco/`、`src/` 并列，本仓库独立维护服务源码、测试、部署脚本和 systemd 配置；Tenco 上位机保留客户端，本服务不链接到 Windows Qt 应用，也不作为 ROS 包构建。厂商 SDK 从目标机 `/opt/ros/humble` 获取，不复制进仓库。
+完整工作空间的唯一约束为 [根 AGENTS.md](../AGENTS.md)，版本、最近部署与未解决问题集中在 [项目说明](../docs/项目总览.md)。本仓库只保存服务源码、测试、脚本、systemd 和必要接口说明。
 
-2026-10-14 从 Tenco 的 `services/oak-camera/` 提取为独立项目，保留采集恢复、最新版清理和原生采集三次服务源码改动历史；导入 main 为 `32918441be25957ff515cc500028644613ca7d60`，与原 Tenco 服务树相同。见 [迁移方案与记录](docs/develop/相机服务独立项目迁移开发方案与记录.md)。统一约束从 [AGENTS](AGENTS.md) 进入，跨项目状态见 [状态快照](docs/workspace/docs/当前状态.md)。工控机现有源码/构建仍在 `/home/nvidia/tenco-oak-probe-recovery-v1`，运行 `/opt/tenco/bin/oak_camera_service`；本次媒体参数任务将独立仓库源码同步并部署到该目录，实际验证和部署哈希见相机媒体参数开发记录。`Capture/`、SDK、构建产物和凭据不进入版本管理。
+## 构建与测试
 
-原服务来自目标机 `/home/nvidia/tenco-oak-probe`（已按清理约定删除）。历史记录描述当时的仓库归属，后续开发以本项目为准。源码首次纳管与原始哈希见 [开发方案](docs/history/OAK相机采集恢复开发方案.md) 和 [诊断记录](docs/history/相机断流排查开发记录.md)。未纳管原工程的 build、PDF、媒体、安装脚本或第三方代码。
-
-在 Ubuntu 22.04 / Jetson ARM64（已有 DepthAI 2.31.1、OpenCV 4.8）构建：
+Ubuntu 22.04/Jetson ARM64 已有 DepthAI 2.31.1、OpenCV 4.8；另需 pkg-config、JSONCPP、libavformat/libavcodec/libavutil 开发库及带 libx264 的 FFmpeg，测试需要 ffmpeg/ffprobe。
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_PREFIX_PATH=/opt/ros/humble
@@ -17,32 +14,42 @@ cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure
 ```
 
-`oak_capture_recovery` 测试真实恢复循环的设备缺失、读帧异常、卡帧、缓存、录像不自动续录及停止/重开。`oak_http_recovery` 运行同一 HTTP/恢复代码、替换为测试采集源，验证多帧、503/EOF、故障重连、媒体接口及客户连接回收。测试不占用 USB，也不操作原在线服务。实际 USB/设备故障恢复须部署后另验收。
+恢复测试运行生产恢复循环，覆盖设备缺失、读帧异常、卡帧、缓存、停止/重开与录像不自动续录。HTTP 测试替换为假采集源，覆盖多帧、503/EOF、重连、媒体参数和客户连接回收；不占用 USB、不修改在线服务。物理 USB、SDK 卡死和长期故障另需现场验收。
 
-新接口：`GET /camera/capabilities`、`GET/PUT /camera/settings`；完整字段、并发、持久化、curl/Python调用和运维见 [接口调用说明](docs/相机媒体参数与拍摄接口调用说明.md)。Tenco入口为配置维护 → 视频与相机。
+## 接口与输出
 
-兼容接口：`GET /camera/status`、`GET /camera/stream.mjpeg`、`POST /camera/photo`、`POST /camera/record/start`、`POST /camera/record/stop`。status 的原字段保留；新增 `frameId`（重连不倒退）、`lastFrameAgeMs`（无帧 -1）、`reconnectCount`（累计采集失败）、`lastCaptureError`（恢复后仍保留最近故障）。健康状态要求收到合法新帧，使用单调时钟；未连接或帧过期的流返回 503，不发旧缓存。
+完整字段、并发、错误、持久化、curl/Python 调用见 [相机媒体参数与拍摄接口调用说明](docs/相机媒体参数与拍摄接口调用说明.md)。
 
-默认画面保持 960×540@15、JPEG 70。采集连续 5 秒无合法新帧则重建；帧超过 1 秒即不作为正常图像提供；失败退避 1、2、4、8、10 秒，持续健康 5 秒后复位退避。失败关闭当前录像，恢复后不会自动续录。
+| 方法与路径 | 用途 |
+|---|---|
+| GET /camera/capabilities | 原生模式、尺寸/FPS 和编码能力 |
+| GET/PUT /camera/settings | 版本校验、配置写入和实际应用状态 |
+| GET /camera/status | 采集健康、实际参数、帧龄、录像/丢帧指标 |
+| GET /camera/stream.mjpeg | MJPEG 预览 |
+| POST /camera/photo | 保存一张 JPEG |
+| POST /camera/record/start、/stop | 开始录像、停止并封装 MP4 |
 
-NET-20261016-01候选新增预览JPEG优化Huffman表，默认启用；status.previewJpegOptimized表示该编码选项，`--disable-preview-jpeg-optimization`恢复旧预览编码。不降低尺寸/FPS/质量参数，不改照片/录像；multipart发送归并减少小发送。相同现场输入基准减少约4%，不等于已上线带宽降幅；当前部署阶段、候选哈希、CPU代价与回退见[开发记录](docs/develop/无线预览传输优化开发记录.md)。
+默认 IMX378 原生输入 4056×3040@30；预览 960×540@15/JPEG70；照片原生 JPEG90/源 2 FPS；录像 1280×720@30 目标/H.264 yuv420p MP4。预览/照片/录像可独立调整，比例不符时保留完整视野补黑边。照片 FPS 指源刷新，不代表自动批量保存。原生 12MP 录像可选但不保证 15 FPS，默认低分辨率档位按真实文件 FPS 和完整解码验收。
 
-当前默认：IMX378原生4056×3040@30输入；预览960×540@15、照片原生JPEG90/照片源2FPS、录像1280×720@30目标/H.264 yuv420p MP4。设备端选帧与缩放降低USB/CPU负载，尺寸比例不一致时完整画面补黑边。原生12MP录像可选但不保证15FPS；默认低分辨率档位通过真实文件FPS与解码验收。使用真实时间戳，不填重复帧。有界3帧编码队列、CRF23、4线程保持，队列满丢最旧帧并统计。原生照片源、录像源和预览5秒无新帧均重建，录像不自动续录；低FPS新鲜度按至少1.5个输出周期放宽。
+PUT 使用 expectedRevision，原子持久化后返回 202，GET 区分 pending/applied/rejected 和 activeSettings。采集线程重建应用配置，HTTP 不等待 SDK 打开/销毁；失败恢复上一有效配置，应用中退出也保留 fallback。录像中或未就绪拒绝改参，客户端不能在启动或本地保存时覆盖设备设置。
 
-配置在采集线程重建生效，HTTP不等待SDK打开/销毁。PUT校验expectedRevision并持久化后返回202，GET区分pending/applied/rejected和实际activeSettings；失败回退上一有效配置，改参期间退出也保留配置回退。录像中/未就绪拒改；不得在客户端启动或本地保存时无条件覆盖工控机配置。
+原生/照片/录像/预览的健康按合法新帧和单调时钟判断；默认连续 5 秒无帧重建，正常帧新鲜度默认 1 秒，低 FPS 按至少 1.5 个输出周期放宽。失败退避 1/2/4/8/10 秒，健康 5 秒复位。未连接/旧缓存流返回 503；采集故障关闭录像，恢复后不自动续录。
 
-`--capture-jpeg-quality` 控制照片质量（1～100），`--recording-crf` 控制录像质量（0～51，越小文件越大）。默认两个保存目录均为当前工作目录下Capture；目标机必须安装本目录的 `systemd/20-native-capture.conf` 到 `/etc/systemd/system/tenco-oak-camera.service.d/20-native-capture.conf`，使开机启动和手动重启使用绝对路径 `/home/nvidia/tenco-oak-probe-recovery-v1/Capture`。drop-in同时清除旧unit宽泛pkill；systemd停止自己的cgroup。既有业务媒体不迁移/删除。
+录像使用真实时间戳，不填重复帧；编码队列最多 3 帧，满时丢最旧帧并统计，默认 CRF23/4 线程。状态和预览不等待磁盘封装；正常停止等待有界队列并封装，分片降低异常退出影响，不承诺断电零丢失。
 
-构建需要pkg-config、JSONCPP、libavformat/libavcodec/libavutil开发库及含libx264的FFmpeg；测试需要ffmpeg/ffprobe。DepthAI2.31.1在该设备使用XLinkOut::setFpsLimit时原生/预览流停滞，当前采用设备Script选完整帧后再缩放/传输。历史原生12MP软件录像4～5FPS与旧部署事实保留在 [原生采集记录](docs/history/OAK原生拍照录像开发记录.md)，不作为当前默认录像档位。
+status 保留 frameId、lastFrameAgeMs、reconnectCount、lastCaptureError、原生帧龄和尺寸、recordingActualFps/recordingDroppedFrames/lastRecordingError、mediaConfiguration 等诊断。previewJpegOptimized 表示预览 Huffman 优化，默认开启，可用 `--disable-preview-jpeg-optimization` 关闭；不改变照片/录像或 settings revision。同输入编码历史减少约 4%，不是所有无线场景带宽收益的承诺。
 
-status新增sensorName/nativeWidth/nativeHeight、captureJpegQuality/recordingCrf、recordingCodec/recordingContainer、nativeFrameId/lastNativeFrameAgeMs、recordingFrames/recordingDroppedFrames/recordingActualFps/lastRecordingError、mediaConfiguration；recording仅在编码线程仍活动时为true。编码线程仅持有媒体状态短锁，状态/MJPEG不等待磁盘封装。正常停止会等待有界队列编码并封装，分片减少异常退出对整段文件的影响，不承诺断电零丢失。
+DepthAI 2.31.1 的 XLinkOut::setFpsLimit 在该设备曾导致停流，当前使用设备 Script 选完整帧后缩放/传输。SDK 打开/销毁使用自身超时，不能保证物理设备/SDK 卡死时具有假源相同停止时延。最多 16 客户，socket 读写超时 2 秒，退出中断客户并回收线程。更多参数见 `--help`，非法数值/关系明确退出。
 
-新增参数：`--frame-freshness-ms`、`--no-frame-timeout-ms`、`--reconnect-interval-ms`、`--reconnect-max-interval-ms`，其他参数见 `--help`；数值/关系校验失败明确退出。每次采集连接/失败写带时间的日志。最多 16 个客户连接，socket 读写超时 2 秒，退出中断客户并回收线程。
+## 运维和部署
 
-DepthAI Device 的打开/销毁使用 SDK 自身超时，无法保证物理设备/SDK 卡死时与假采集源相同的停止时延；systemd 超时兜底和真实设备开关/掉线须现场验证。HTTP 服务成功不等于 USB 供电、线材或相机硬件缺陷已解决。
+2026-10-17 已统一部署至 `/home/nvidia/tenco-project`：源码为 `oak-camera-service/`，构建为 `build/camera/`，在线程序为 `install/camera/oak_camera_service`，systemd 为 `tenco-oak-camera.service`。照片/录像保存至源码目录的 `Capture/`；旧 `/opt/tenco/media` 的历史媒体移至 `Capture/legacy/` 并保留旧路径兼容链接，保护全部业务媒体。`Capture/`、构建产物和凭据不纳入版本管理。
 
-部署前先查 `systemctl cat tenco-oak-camera.service`，确认 ExecStart 指向 `/opt/tenco/bin/oak_camera_service`；执行 `scripts/deploy_verified_service.sh` 时传入经过验证的二进制和期望 SHA256，在已授权维护窗口通过sudo运行。脚本拒绝录像中的切换，暂存旧程序、原子替换并重启相机服务；失败先恢复旧程序。连续三次健康且frameId增长、安装哈希一致后，删除本次临时旧程序，成功回退后也删除重复副本，只保留当前有效版本。不会安装依赖、pkill其他程序、改当前systemd/Lua/车辆控制或删除业务媒体。
+目标机完整服务文件位于项目 `systemd/tenco-oak-camera.service`，由 /etc/systemd/system 链接加载，不再使用历史宽泛 pkill。仓库的 `systemd/20-native-capture.conf` 已同步新安装及媒体路径，可供媒体参数升级事务使用。上线前核对 `systemctl cat tenco-oak-camera.service` 和实际 ExecStart，不从本地文件推断现场版本。在项目根目录可使用 `bash src/deployment/project.sh build-camera`、`test`、`status`；构建不会覆盖 install/ 内的在线程序，部署脚本负责已验证候选的安装切换。
 
-2026-10-13用户要求清理长期旧版本/备份；原 `/home/nvidia/tenco-oak-probe` 与上线旧程序备份进入清理范围，最新版源码/Release仍在 `/home/nvidia/tenco-oak-probe-recovery-v1`。当前恢复方法以受控源码重新构建/部署为准，不能使用已删除备份。实际清单与验证见 [清理记录](docs/history/相机旧版本与备份清理开发记录.md)。
+用户明确要求部署后，在已授权维护窗口使用已验证产物及 SHA256：
 
-2026-10-15媒体参数升级使用 `scripts/deploy_media_settings.py VERIFIED_BINARY SHA256 --drop-in systemd/20-native-capture.conf --evidence /绝对路径/evidence.json`，以root在已授权相机维护窗口执行。该事务同时安装二进制与drop-in，验证原生照片、默认720p实际至少15FPS、完整解码、持续新帧与运行哈希，失败恢复程序/drop-in/设置；成功只保留最新版。旧脚本只做持续新帧验证，不替代此次媒体参数升级验收。详见 [开发方案](docs/develop/相机媒体参数接口开发方案.md) 与 [开发记录](docs/develop/相机媒体参数接口开发记录.md)。
+- `scripts/deploy_verified_service.sh VERIFIED_BINARY SHA256`：拒绝录像中切换，临时保留旧程序、原子安装并重启；连续健康/新帧和哈希验证后删除临时旧程序，失败先恢复。
+- 媒体参数升级使用 `scripts/deploy_media_settings.py VERIFIED_BINARY SHA256 --drop-in systemd/20-native-capture.conf --evidence /绝对路径/evidence.json`，以 root 执行；同时验证原生照片、默认录像真实 >=15 FPS、完整解码和配置回退。
+
+旧脚本的持续新帧检查不能替代媒体参数升级验收。只保留当前有效版本，不保留长期重复二进制；不能使用已删除的旧备份回退，必要时从受控源码重建。部署不扩展到车辆/云台运动、USB 故障注入、删除业务媒体或修改其他进程。

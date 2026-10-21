@@ -11,7 +11,7 @@ expected="$2"
 actual="$(sha256sum -- "$binary")"; actual="${actual%% *}"
 [[ "$actual" == "$expected" ]] || { echo "Binary SHA256 mismatch" >&2; exit 2; }
 service=tenco-oak-camera.service
-target=/opt/tenco/bin/oak_camera_service
+target=/home/nvidia/tenco-project/install/camera/oak_camera_service
 systemctl show "$service" -p ExecStart --value | grep -Fq "path=$target ;" || {
   echo "Unexpected systemd executable; inspect before deployment" >&2; exit 2;
 }

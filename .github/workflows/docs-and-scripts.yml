@@ -1,19 +1,15 @@
-name: 文档与脚本检查
+name: 脚本检查
 on:
   push:
   pull_request:
 jobs:
-  docs:
+  scripts:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: 独立文档快照与三仓工具回归
-        run: |
-          python docs/workspace/tools/project_docs.py check --documents-only
-          python docs/workspace/tools/tests/test_project_docs.py
       - name: 部署与测试脚本语法
         run: |
           bash -n scripts/deploy_verified_service.sh
