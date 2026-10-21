@@ -17,8 +17,8 @@ import time
 import urllib.request
 
 SERVICE = 'tenco-oak-camera.service'
-TARGET = Path('/opt/tenco/bin/oak_camera_service')
-ROOT = Path('/home/nvidia/tenco-oak-probe-recovery-v1')
+TARGET = Path('/home/nvidia/tenco-project/install/camera/oak_camera_service')
+ROOT = Path('/home/nvidia/tenco-project/oak-camera-service')
 DROP_IN = Path('/etc/systemd/system/tenco-oak-camera.service.d/20-native-capture.conf')
 SETTINGS = ROOT / 'camera-settings.json'
 
