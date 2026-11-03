@@ -36,9 +36,19 @@ if(BUILD_TESTING)
     add_test(NAME oak_http_recovery COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_http.py $<TARGET_FILE:oak_camera_service_fixture>)
     set_tests_properties(oak_http_recovery PROPERTIES TIMEOUT 30)
+    add_test(NAME oak_depth_http COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_depth.py $<TARGET_FILE:oak_camera_service_fixture>)
+    set_tests_properties(oak_depth_http PROPERTIES TIMEOUT 30)
+    add_test(NAME oak_rgb_demand COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_demand.py $<TARGET_FILE:oak_camera_service_fixture>)
+    set_tests_properties(oak_rgb_demand PROPERTIES TIMEOUT 30)
     add_test(NAME oak_media_settings COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_settings.py $<TARGET_FILE:oak_camera_service_fixture>)
     set_tests_properties(oak_media_settings PROPERTIES TIMEOUT 30)
+    add_executable(oak_settings_persistence_test tests/test_settings_persistence.cpp tests/fake_capture_source.cpp)
+    target_link_libraries(oak_settings_persistence_test PRIVATE oak_camera_core)
+    add_test(NAME oak_settings_persistence COMMAND oak_settings_persistence_test)
+    set_tests_properties(oak_settings_persistence PROPERTIES TIMEOUT 30)
     add_test(NAME oak_deployment_transaction COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_deploy_transaction.py)
     set_tests_properties(oak_deployment_transaction PROPERTIES TIMEOUT 10)

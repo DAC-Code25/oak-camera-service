@@ -2,6 +2,7 @@
 #include <json/json.h>
 #include <filesystem>
 #include <string>
+#include <functional>
 #include "oak_capture_source.h"
 
 struct OakOutputSettings {
@@ -19,5 +20,17 @@ OakMediaSettings oakSettingsFromJson(const Json::Value& value);
 void validateOakMediaSettings(const OakMediaSettings& settings, const OakCaptureInfo* info = nullptr);
 Json::Value oakParseJson(const std::string& text);
 std::string oakJsonText(const Json::Value& value);
-void oakPersistSettings(const std::filesystem::path& path, const OakMediaSettings& settings, std::uint64_t revision,
-                        const OakMediaSettings* fallback = nullptr);
+struct OakSettingsPersistence {
+    bool confirmed = false;
+    std::string error;
+};
+// Optional directory operations allow deterministic post-rename fault tests.
+struct OakSettingsDirectoryOps {
+    std::function<int(const std::filesystem::path&)> open;
+    std::function<int(int)> sync;
+};
+// Throws only before replacement. After rename the new revision is visible;
+// a directory failure returns unconfirmed durability and must not undo memory.
+OakSettingsPersistence oakPersistSettings(const std::filesystem::path& path, const OakMediaSettings& settings,
+                        std::uint64_t revision, const OakMediaSettings* fallback = nullptr,
+                        const OakSettingsDirectoryOps* directoryOps = nullptr);

@@ -58,8 +58,14 @@ Json::Value OakCameraDevice::settingsLocked() const {
     v["applyState"] = applyState_; v["lastError"] = settingsError_;
     v["settings"] = oakSettingsJson(desiredSettings_);
     v["activeSettings"] = hasActiveSettings_ ? oakSettingsJson(activeSettings_) : Json::Value();
-    v["cameraConnected"] = hasFreshFrameLocked(); v["recording"] = recording_ && writer_.stats().active;
+    v["cameraConnected"] = hasFreshCaptureLocked(); v["recording"] = recording_ && writer_.stats().active;
     v["persisted"] = !config_.settingsFile.empty() && persistedRevision_ == settingsRevision_;
+    v["persistenceState"] = config_.settingsFile.empty() ? "memory_only" :
+        v["persisted"].asBool() ? "confirmed" : "unconfirmed";
+    v["persistenceError"] = persistenceError_;
+    v["previewTransportActive"] = running_.load() && std::chrono::steady_clock::now() < previewDemandUntil_;
+    v["nativeTransportActive"] = running_.load() && nativeDemand_;
+    v["recordingTransportActive"] = running_.load() && recording_;
     return v;
 }
 Json::Value OakCameraDevice::settings() const {
@@ -75,6 +81,7 @@ Json::Value OakCameraDevice::capabilities() const {
     v["photoFpsMeaning"] = "native_photo_buffer_refresh_rate_not_continuous_file_saving";
     v["recordingCodec"] = "h264"; v["recordingContainer"] = "mp4";
     v["minimumOutputFps"] = 1; v["previewMaxWidth"] = 1920; v["previewMaxHeight"] = 1080;
+    v["depth"] = depthStatusLocked();
     v["resolutions"] = Json::Value(Json::arrayValue);
     for(const auto& size : std::vector<std::pair<int,int>>{{640,480},{960,540},{1280,720},{1280,960},{1920,1080},{2028,1520},
                                                          {captureInfo_.nativeWidth,captureInfo_.nativeHeight}}) {
@@ -92,6 +99,7 @@ Json::Value OakCameraDevice::updateSettings(const Json::Value& request) {
     const auto next = oakSettingsFromJson(request["settings"]);
     std::lock_guard<std::mutex> controlLock(controlMutex_);
     std::uint64_t revision;
+    bool sameValue = false;
     OakMediaSettings fallback;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -99,17 +107,24 @@ Json::Value OakCameraDevice::updateSettings(const Json::Value& request) {
             throw std::logic_error("settings_revision_conflict");
         if(applyState_ == "pending") throw std::logic_error("settings_application_pending");
         if(recording_ || writer_.stats().active) throw std::logic_error("recording_in_progress");
-        if(!hasFreshNativeFrameLocked()) throw std::logic_error("camera_not_ready");
+        if(!hasFreshCaptureLocked()) throw std::logic_error("camera_not_ready");
         validateOakMediaSettings(next, &captureInfo_);
-        if(oakSettingsJson(next) == oakSettingsJson(desiredSettings_)) return settingsLocked();
-        revision = settingsRevision_ + 1;
+        sameValue = oakSettingsJson(next) == oakSettingsJson(desiredSettings_);
+        if(sameValue && (config_.settingsFile.empty() || persistedRevision_ == settingsRevision_)) return settingsLocked();
+        revision = sameValue ? settingsRevision_ : settingsRevision_ + 1;
         if(revision == 0) throw std::logic_error("settings_revision_exhausted");
         fallback = activeSettings_;
     }
-    oakPersistSettings(config_.settingsFile, next, revision, &fallback);
+    const auto persisted = oakPersistSettings(config_.settingsFile, next, revision,
+        sameValue ? nullptr : &fallback, config_.settingsDirectoryOps.get());
+    if(!persisted.error.empty()) std::cerr << makeTimestamp() << " 相机设置已替换，持久化未确认：" << persisted.error << std::endl;
     std::lock_guard<std::mutex> lock(mutex_);
+    if(sameValue) {
+        persistedRevision_ = persisted.confirmed ? revision : 0; persistenceError_ = persisted.error;
+        return settingsLocked(); // Explicit durability retry, no new revision or device restart.
+    }
     desiredSettings_ = next; settingsRevision_ = revision; applyState_ = "pending"; settingsError_.clear();
-    persistedRevision_ = config_.settingsFile.empty() ? 0 : revision;
+    persistedRevision_ = persisted.confirmed ? revision : 0; persistenceError_ = persisted.error;
     rollbackSettings_ = fallback;
     reconfigure_ = true; cameraConnected_ = false; clearFramesLocked(); frameCv_.notify_all();
     return settingsLocked();
@@ -163,10 +178,24 @@ OakStatus OakCameraDevice::savePhoto() {
     OakOutputSettings photo;
     std::filesystem::path outputPath;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if(!hasFreshNativeFrameLocked()) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if(!hasFreshCaptureLocked() || applyState_ == "pending") {
             auto result = currentStatusLocked(); result.success = false;
-            result.message = "no fresh native frame available"; return result;
+            result.message = "camera not ready or settings pending"; return result;
+        }
+        const auto requestedAt = std::chrono::steady_clock::now();
+        const auto revision = activeRevision_;
+        nativeDemand_ = true;
+        const auto timeout = std::chrono::milliseconds(std::min(config_.noFrameTimeoutMs + 250,
+            static_cast<int>(freshness(config_.frameFreshnessMs, activeSettings_.photo.fps).count()) + 500));
+        frameCv_.wait_for(lock, timeout, [&] {
+            return !running_.load() || !cameraConnected_ || activeRevision_ != revision ||
+                (hasFreshNativeFrameLocked() && lastNativeFrameTime_ >= requestedAt);
+        });
+        nativeDemand_ = false;
+        if(!hasFreshNativeFrameLocked() || activeRevision_ != revision || lastNativeFrameTime_ < requestedAt) {
+            auto result = currentStatusLocked(); result.success = false;
+            result.message = "timed out waiting for a new native photo frame"; return result;
         }
         native = latestNativeYuv_; info = captureInfo_; photo = activeSettings_.photo;
         outputPath = config_.snapshotDir / ("oak_photo_" + makeTimestamp() + ".jpg");
@@ -223,9 +252,7 @@ OakStatus OakCameraDevice::startRecording() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto result = currentStatusLocked();
-        if(!hasFreshNativeFrameLocked() || applyState_ == "pending" ||
-           lastRecordingFrameTime_ == std::chrono::steady_clock::time_point{} ||
-           std::chrono::steady_clock::now()-lastRecordingFrameTime_ > freshness(config_.frameFreshnessMs, activeSettings_.recording.fps)) {
+        if(!hasFreshCaptureLocked() || applyState_ == "pending") {
             result.success = false; result.message = "no fresh capture frame available or settings pending"; return result;
         }
         if(recording_ && writer_.stats().active) {
@@ -242,8 +269,25 @@ OakStatus OakCameraDevice::startRecording() {
         auto result = currentStatusLocked(); result.success = false;
         result.message = "failed to start recording: " + std::string(e.what()); return result;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    if(!hasFreshCaptureLocked() || applyState_ == "pending") {
+        lock.unlock(); writer_.stop(); lock.lock();
+        auto result = currentStatusLocked(); result.success = false; result.message = "camera became unavailable while starting recording";
+        return result;
+    }
+    recordingDemandStarted_ = std::chrono::steady_clock::now();
     recording_ = true; lastRecordingPath_ = outputPath.string(); lastMessage_ = "recording started";
+    // No recording transport is enabled before the writer is ready. The first
+    // newly requested frame is submitted by the capture thread before success.
+    frameCv_.wait_for(lock, std::chrono::milliseconds(std::min(config_.noFrameTimeoutMs + 250, 1500)), [&] {
+        return !running_.load() || !cameraConnected_ || lastRecordingFrameTime_ >= recordingDemandStarted_;
+    });
+    if(!hasFreshCaptureLocked() || lastRecordingFrameTime_ < recordingDemandStarted_) {
+        recording_ = false;
+        lock.unlock(); writer_.stop(); lock.lock();
+        auto result = currentStatusLocked(); result.success = false; result.message = "timed out waiting for the first recording frame";
+        return result;
+    }
     auto result = currentStatusLocked(); result.success = true; result.path = lastRecordingPath_;
     return result;
 }
@@ -260,11 +304,12 @@ OakStatus OakCameraDevice::stopRecording() {
     return result;
 }
 
-bool OakCameraDevice::waitForNextJpeg(std::uint64_t afterFrameId, std::uint64_t& outFrameId, std::vector<std::uint8_t>& outJpeg, std::chrono::milliseconds timeout) const {
+bool OakCameraDevice::waitForNextJpeg(std::uint64_t afterFrameId, std::uint64_t& outFrameId, std::vector<std::uint8_t>& outJpeg, std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
-    if(!running_.load() || !hasFreshFrameLocked()) return false;
+    if(!hasFreshCaptureLocked()) return false;
+    previewDemandUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     const auto ready = frameCv_.wait_for(lock, timeout, [&] {
-        return !running_.load() || !cameraConnected_ || frameId_ > afterFrameId;
+        return !running_.load() || !cameraConnected_ || (hasFreshFrameLocked() && frameId_ > afterFrameId);
     });
 
     if(!ready || !running_.load() || !hasFreshFrameLocked() || frameId_ <= afterFrameId) {
@@ -284,6 +329,83 @@ std::optional<std::vector<std::uint8_t>> OakCameraDevice::latestJpeg() const {
     return latestJpeg_;
 }
 
+bool OakCameraDevice::hasFreshDepthLocked() const {
+    return hasFreshCaptureLocked() && config_.depthEnabled && captureInfo_.depthSupported &&
+        !latestDepth_.empty() && lastDepthFrameTime_ != std::chrono::steady_clock::time_point{} &&
+        std::chrono::steady_clock::now() - lastDepthFrameTime_ <= freshness(config_.frameFreshnessMs, config_.depthFps);
+}
+
+Json::Value OakCameraDevice::depthStatusLocked() const {
+    Json::Value v;
+    v["enabled"] = config_.depthEnabled;
+    v["supported"] = captureInfo_.depthSupported;
+    v["available"] = hasFreshDepthLocked();
+    v["transportActive"] = running_.load() && config_.depthEnabled && captureInfo_.depthSupported &&
+        std::chrono::steady_clock::now() < depthDemandUntil_;
+    v["width"] = captureInfo_.depthWidth; v["height"] = captureInfo_.depthHeight;
+    v["fpsLimit"] = config_.depthFps;
+    v["frameId"] = Json::UInt64(depthFrameId_);
+    v["lastFrameAgeMs"] = lastDepthFrameTime_ == std::chrono::steady_clock::time_point{} ? Json::Int64(-1) :
+        Json::Int64(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-lastDepthFrameTime_).count());
+    v["unit"] = "millimeter"; v["invalidValue"] = 0; v["pixelFormat"] = "uint16";
+    v["reference"] = "rectified_left_camera"; v["alignedToRgb"] = false;
+    v["visualMinMm"] = config_.depthVisualMinMm; v["visualMaxMm"] = config_.depthVisualMaxMm;
+    v["message"] = !config_.depthEnabled ? "深度采集已禁用" : !cameraConnected_ ? "相机未连接" :
+        !captureInfo_.depthSupported ? "当前设备不支持双目深度" : hasFreshDepthLocked() ? "深度图可用" :
+        v["transportActive"].asBool() ? "等待新鲜深度帧" : "按需传输，等待客户端请求";
+    return v;
+}
+
+Json::Value OakCameraDevice::depthStatus() const {
+    std::lock_guard<std::mutex> lock(mutex_); return depthStatusLocked();
+}
+
+bool OakCameraDevice::waitForDepthImage(bool png, std::uint64_t afterFrameId, OakDepthImage& result,
+                                       std::chrono::milliseconds timeout) {
+    cv::Mat depth;
+    OakDepthImage current;
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if(!hasFreshCaptureLocked() || !config_.depthEnabled || !captureInfo_.depthSupported) return false;
+        depthDemandUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        const bool ready = frameCv_.wait_for(lock, timeout, [&] {
+            return !running_.load() || !cameraConnected_ || (hasFreshDepthLocked() && depthFrameId_ > afterFrameId);
+        });
+        if(!ready || !hasFreshDepthLocked() || depthFrameId_ <= afterFrameId) return false;
+        depth = latestDepth_; // Immutable ref-counted raw frame, bounded to one current frame.
+        current.frameId = depthFrameId_; current.width = depth.cols; current.height = depth.rows;
+        current.capturedMonotonicMs = std::chrono::duration_cast<std::chrono::milliseconds>(lastDepthFrameTime_.time_since_epoch()).count();
+    }
+    std::lock_guard<std::mutex> encodingLock(depthEncodingMutex_);
+    auto& cached = png ? cachedDepthPng_ : cachedDepthJpeg_;
+    if(cached.frameId == current.frameId && cached.bytes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(!hasFreshDepthLocked() || std::chrono::steady_clock::now().time_since_epoch() -
+           std::chrono::milliseconds(current.capturedMonotonicMs) > freshness(config_.frameFreshnessMs, config_.depthFps)) return false;
+        result = cached; return true;
+    }
+    auto bytes = std::make_shared<std::vector<std::uint8_t>>();
+    if(png) {
+        // Lossless native millimeters. Low compression bounds CPU cost.
+        if(!cv::imencode(".png", depth, *bytes, {cv::IMWRITE_PNG_COMPRESSION, 1})) return false;
+    } else {
+        cv::Mat gray, visual;
+        depth.convertTo(gray, CV_8U, 255.0/(config_.depthVisualMaxMm-config_.depthVisualMinMm),
+                        -255.0*config_.depthVisualMinMm/(config_.depthVisualMaxMm-config_.depthVisualMinMm));
+        cv::applyColorMap(gray, visual, cv::COLORMAP_TURBO);
+        visual.setTo(cv::Scalar(0,0,0), depth == 0);
+        if(!cv::imencode(".jpg", visual, *bytes, {cv::IMWRITE_JPEG_QUALITY, config_.depthJpegQuality})) return false;
+    }
+    current.bytes = bytes;
+    // Encoding never holds the capture/status lock; reject frames invalidated by a disconnect.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(!hasFreshDepthLocked() || std::chrono::steady_clock::now().time_since_epoch() -
+           std::chrono::milliseconds(current.capturedMonotonicMs) > freshness(config_.frameFreshnessMs, config_.depthFps)) return false;
+    }
+    cached = current; result = std::move(current); return true;
+}
+
 void OakCameraDevice::runCaptureLoop() {
     int retryDelayMs = config_.reconnectIntervalMs;
     while(running_.load()) {
@@ -301,25 +423,46 @@ void OakCameraDevice::runCaptureLoop() {
             source->open(sourceConfig);
             const std::string id = source->deviceId();
             const auto info = source->info();
+            { std::lock_guard<std::mutex> lock(mutex_); captureInfo_ = info; }
             validateOakMediaSettings(sourceConfig.media, &info);
             auto lastValidNative = std::chrono::steady_clock::now();
             auto lastValidRecording = lastValidNative;
             auto lastValidFrame = std::chrono::steady_clock::now();
+            auto lastValidHealth = lastValidFrame;
             auto healthySince = lastValidFrame;
             bool seenFrame = false;
+            bool seenPreview = false, seenNative = false, seenRecording = false, seenHealth = false;
             while(running_.load()) {
-                { std::lock_guard<std::mutex> lock(mutex_); if(reconfigure_) break; }
+                bool depthDemand;
+                OakRgbDemand rgbDemand;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_); if(reconfigure_) break;
+                    const auto now = std::chrono::steady_clock::now();
+                    depthDemand = config_.depthEnabled && now < depthDemandUntil_;
+                    rgbDemand = {!seenPreview || now < previewDemandUntil_, !seenNative || nativeDemand_,
+                                 !seenRecording || recording_};
+                }
+                source->setDepthDemand(depthDemand);
+                source->setRgbDemand(rgbDemand);
                 auto captured = source->read(std::chrono::milliseconds(100));
                 const auto& image = captured.preview;
                 const auto now = std::chrono::steady_clock::now();
-                if(now - lastValidFrame >= std::chrono::milliseconds(config_.noFrameTimeoutMs)) {
-                    throw std::runtime_error("preview stalled: no valid new frame within timeout");
+                if(captured.healthAt != std::chrono::steady_clock::time_point{} && captured.healthAt <= now &&
+                   now-captured.healthAt <= freshness(config_.frameFreshnessMs, 2)) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if(captured.healthAt > lastCaptureFrameTime_) {
+                        lastCaptureFrameTime_ = captured.healthAt; ++captureFrameId_;
+                        lastValidHealth = now; seenHealth = true;
+                    }
                 }
-                if(now - lastValidNative >= std::chrono::milliseconds(config_.noFrameTimeoutMs)) {
-                    throw std::runtime_error("native capture stalled: no valid new frame within timeout");
+                if(!captured.depthMillimeters.empty() && depthDemand && info.depthSupported &&
+                   captured.depthMillimeters.type() == CV_16UC1 && captured.depthMillimeters.cols == info.depthWidth &&
+                   captured.depthMillimeters.rows == info.depthHeight && captured.depthAt != std::chrono::steady_clock::time_point{} &&
+                   captured.depthAt <= now && now-captured.depthAt <= freshness(config_.frameFreshnessMs, config_.depthFps)) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    latestDepth_ = std::move(captured.depthMillimeters); lastDepthFrameTime_ = captured.depthAt;
+                    ++depthFrameId_; frameCv_.notify_all();
                 }
-                if(now - lastValidRecording >= std::chrono::milliseconds(config_.noFrameTimeoutMs))
-                    throw std::runtime_error("recording source stalled: no valid new frame within timeout");
                 if(captured.nativeYuv) {
                     if(info.nativeWidth < 2 || info.nativeHeight < 2 ||
                        captured.nativeYuv->size() != static_cast<std::size_t>(info.nativeWidth) * info.nativeHeight * 3 / 2) {
@@ -327,17 +470,18 @@ void OakCameraDevice::runCaptureLoop() {
                     }
                     const auto stamp = captured.capturedAt == std::chrono::steady_clock::time_point{} ? now : captured.capturedAt;
                     if(stamp <= now && now - stamp <= freshness(config_.frameFreshnessMs, sourceConfig.media.photo.fps)) {
-                        lastValidNative = now;
+                        lastValidNative = now; seenNative = true;
                         std::lock_guard<std::mutex> lock(mutex_);
                         if(revision != settingsRevision_) break;
                         latestNativeYuv_ = std::move(captured.nativeYuv);
                         lastNativeFrameTime_ = stamp; captureInfo_ = info; ++nativeFrameId_;
+                        frameCv_.notify_all();
                     }
                 }
                 if(captured.recordingYuv) {
                     if(captured.recordingAt == std::chrono::steady_clock::time_point{}) captured.recordingAt = now;
-                    if(captured.recordingAt > now || now-captured.recordingAt > freshness(config_.frameFreshnessMs, sourceConfig.media.recording.fps)) continue;
-                    lastValidRecording = now;
+                    if(captured.recordingAt <= now && now-captured.recordingAt <= freshness(config_.frameFreshnessMs, sourceConfig.media.recording.fps)) {
+                    lastValidRecording = now; seenRecording = true;
                     const auto& r = sourceConfig.media.recording;
                     const int w = r.width ? r.width : info.nativeWidth, h = r.height ? r.height : info.nativeHeight;
                     if(captured.recordingYuv->size() != static_cast<std::size_t>(w)*h*3/2)
@@ -345,16 +489,19 @@ void OakCameraDevice::runCaptureLoop() {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if(revision != settingsRevision_) break;
                     lastRecordingFrameTime_ = captured.recordingAt;
-                    if(recording_) writer_.submit(std::move(captured.recordingYuv), captured.recordingAt);
+                    if(recording_ && captured.recordingAt >= recordingDemandStarted_)
+                        writer_.submit(std::move(captured.recordingYuv), captured.recordingAt);
+                    frameCv_.notify_all();
+                    }
                 }
-                if(image.empty()) continue;
+                if(!image.empty() && rgbDemand.preview) {
                 if(image.type() != CV_8UC3 || image.cols != sourceConfig.media.preview.width ||
                    image.rows != sourceConfig.media.preview.height) {
                     throw std::runtime_error("invalid BGR preview image");
                 }
                 auto jpeg = encodeJpeg(image);
                 if(jpeg.empty()) throw std::runtime_error("JPEG encoding produced no frame");
-                lastValidFrame = now;
+                lastValidFrame = now; seenPreview = true;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if(!running_.load()) break;
@@ -362,22 +509,45 @@ void OakCameraDevice::runCaptureLoop() {
                     latestJpeg_ = std::move(jpeg);
                     lastFrameTime_ = now;
                     ++frameId_;
-                    cameraConnected_ = latestNativeYuv_ != nullptr && lastRecordingFrameTime_ != std::chrono::steady_clock::time_point{};
+                    frameCv_.notify_all();
+                }
+                }
+                // Idle outputs are intentionally silent. Only a demanded stream
+                // has a stall deadline; the tiny real sensor health stream is
+                // checked continuously, independently of HTTP polling.
+                if(!rgbDemand.preview) lastValidFrame = now;
+                if(!rgbDemand.native) lastValidNative = now;
+                if(!rgbDemand.recording) lastValidRecording = now;
+                if(now-lastValidHealth >= std::chrono::milliseconds(std::max(config_.noFrameTimeoutMs, 1000)))
+                    throw std::runtime_error("capture health stalled: no valid new sensor frame within timeout");
+                if(now-lastValidFrame >= std::chrono::milliseconds(config_.noFrameTimeoutMs))
+                    throw std::runtime_error("preview stalled: no valid new frame within timeout");
+                if(now-lastValidNative >= std::chrono::milliseconds(config_.noFrameTimeoutMs))
+                    throw std::runtime_error("native capture stalled: no valid new frame within timeout");
+                if(now-lastValidRecording >= std::chrono::milliseconds(config_.noFrameTimeoutMs))
+                    throw std::runtime_error("recording source stalled: no valid new frame within timeout");
+                const bool connected = seenHealth && seenPreview && seenNative && seenRecording;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if(!running_.load() || revision != settingsRevision_) break;
+                    cameraConnected_ = connected;
                     deviceId_ = id;
                     if(cameraConnected_) {
                         if(applyState_ == "pending") {
-                            oakPersistSettings(config_.settingsFile, sourceConfig.media, revision);
-                            persistedRevision_ = config_.settingsFile.empty() ? 0 : revision;
+                            const auto persisted = oakPersistSettings(config_.settingsFile, sourceConfig.media, revision,
+                                nullptr, config_.settingsDirectoryOps.get());
+                            persistedRevision_ = persisted.confirmed ? revision : 0; persistenceError_ = persisted.error;
+                            if(!persisted.error.empty()) std::cerr << makeTimestamp() << " 相机设置运行生效，持久化未确认：" << persisted.error << std::endl;
                         }
                         activeSettings_ = sourceConfig.media; hasActiveSettings_ = true; activeRevision_ = revision;
                         rollbackSettings_.reset();
                         if(applyState_ == "pending") { applyState_ = "applied"; settingsError_.clear(); }
                     }
-                    if(!seenFrame) lastMessage_ = "camera connected";
+                    if(connected && !seenFrame) lastMessage_ = "camera connected";
                     frameCv_.notify_all();
                 }
-                if(!seenFrame) {
-                    std::clog << makeTimestamp() << " capture connected: " << id << std::endl;
+                if(connected && !seenFrame) {
+                    std::clog << makeTimestamp() << " 相机已连接；双目深度=" << (info.depthSupported ? "支持" : "不支持") << std::endl;
                     healthySince = now;
                     seenFrame = true;
                 }
@@ -392,6 +562,12 @@ void OakCameraDevice::runCaptureLoop() {
             failure = "unknown capture exception";
         }
         bool intentionalChange = false;
+        // Wake media waiters before taking the operation lock. A photo/start
+        // request may be waiting for the failing capture thread itself.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            cameraConnected_ = false; frameCv_.notify_all();
+        }
         {
             std::lock_guard<std::mutex> controlLock(controlMutex_);
             {
@@ -404,8 +580,15 @@ void OakCameraDevice::runCaptureLoop() {
                 if(!failure.empty() && applyState_ == "pending" && rollbackSettings_ && revision == settingsRevision_) {
                     settingsError_ = failure; applyState_ = "rejected";
                     desiredSettings_ = *rollbackSettings_; rollbackSettings_.reset();
-                    try { oakPersistSettings(config_.settingsFile, desiredSettings_, settingsRevision_); }
-                    catch(const std::exception& e) { settingsError_ += "; rollback persistence: " + std::string(e.what()); }
+                    try {
+                        const auto persisted = oakPersistSettings(config_.settingsFile, desiredSettings_, settingsRevision_,
+                            nullptr, config_.settingsDirectoryOps.get());
+                        persistedRevision_ = persisted.confirmed ? settingsRevision_ : 0; persistenceError_ = persisted.error;
+                        if(!persisted.error.empty()) std::cerr << makeTimestamp() << " 相机设置已回退，持久化未确认：" << persisted.error << std::endl;
+                    } catch(const std::exception& e) {
+                        persistedRevision_ = 0; persistenceError_ = e.what();
+                        settingsError_ += "; rollback persistence: " + std::string(e.what());
+                    }
                     intentionalChange = true;
                 }
                 if(!failure.empty() && running_.load()) {
@@ -420,8 +603,8 @@ void OakCameraDevice::runCaptureLoop() {
         }
         if(running_.load()) {
             // Log before SDK cleanup so a blocking destructor cannot hide the failure.
-            std::cerr << makeTimestamp() << " capture failed: " << failure
-                      << "; retry in " << retryDelayMs << " ms" << std::endl;
+            std::cerr << makeTimestamp() << " 相机采集异常: " << failure
+                      << "；将在 " << retryDelayMs << " 毫秒后重试" << std::endl;
         }
         // Device cleanup may block in the SDK. Never hold HTTP state locks here.
         source.reset();
@@ -434,12 +617,17 @@ void OakCameraDevice::runCaptureLoop() {
 }
 
 bool OakCameraDevice::hasFreshFrameLocked() const {
-    return running_.load() && cameraConnected_ && !latestJpeg_.empty() &&
+    return hasFreshCaptureLocked() && !latestJpeg_.empty() &&
         std::chrono::steady_clock::now() - lastFrameTime_ <= freshness(config_.frameFreshnessMs, activeSettings_.preview.fps);
 }
 
+bool OakCameraDevice::hasFreshCaptureLocked() const {
+    return running_.load() && cameraConnected_ && lastCaptureFrameTime_ != std::chrono::steady_clock::time_point{} &&
+        std::chrono::steady_clock::now()-lastCaptureFrameTime_ <= freshness(config_.frameFreshnessMs, 2);
+}
+
 bool OakCameraDevice::hasFreshNativeFrameLocked() const {
-    return hasFreshFrameLocked() && latestNativeYuv_ != nullptr &&
+    return hasFreshCaptureLocked() && latestNativeYuv_ != nullptr &&
         std::chrono::steady_clock::now() - lastNativeFrameTime_ <= freshness(config_.frameFreshnessMs, activeSettings_.photo.fps);
 }
 
@@ -449,6 +637,9 @@ void OakCameraDevice::clearFramesLocked() {
     lastRecordingFrameTime_ = {};
     latestJpeg_.clear();
     lastFrameTime_ = {};
+    lastCaptureFrameTime_ = {}; previewDemandUntil_ = {};
+    nativeDemand_ = false; recordingDemandStarted_ = {};
+    latestDepth_.release(); lastDepthFrameTime_ = {}; depthDemandUntil_ = {};
 }
 
 std::string OakCameraDevice::makeTimestamp() {
@@ -476,10 +667,10 @@ std::vector<std::uint8_t> OakCameraDevice::encodeJpeg(const cv::Mat& frame) cons
 
 OakStatus OakCameraDevice::currentStatusLocked() const {
     OakStatus status;
-    status.success = hasFreshFrameLocked();
+    status.success = hasFreshCaptureLocked();
     status.message = lastMessage_;
     status.cameraConnected = status.success;
-    if(cameraConnected_ && !status.success) status.message = "preview frame stale";
+    if(cameraConnected_ && !status.success) status.message = "capture health frame stale";
     const auto media = writer_.stats();
     status.recording = recording_ && media.active;
     status.recordingFrames = media.frames;
@@ -510,6 +701,11 @@ OakStatus OakCameraDevice::currentStatusLocked() const {
     status.lastCaptureError = lastCaptureError_;
     status.reconnectCount = reconnectCount_;
     status.frameId = frameId_;
+    status.captureFrameId = captureFrameId_;
+    if(lastCaptureFrameTime_ != std::chrono::steady_clock::time_point{}) {
+        status.lastCaptureFrameAgeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now()-lastCaptureFrameTime_).count();
+    }
     if(lastFrameTime_ != std::chrono::steady_clock::time_point{}) {
         status.lastFrameAgeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - lastFrameTime_).count();
@@ -565,6 +761,9 @@ std::string oakStatusToJson(const OakStatus& status) {
         << "\"lastCaptureError\":\"" << oakEscapeJson(status.lastCaptureError) << "\","
         << "\"reconnectCount\":" << status.reconnectCount << ","
         << "\"frameId\":" << status.frameId << ","
+        << "\"captureFrameId\":" << status.captureFrameId << ","
+        << "\"lastCaptureFrameAgeMs\":" << status.lastCaptureFrameAgeMs << ","
+        << "\"captureHealthFps\":" << status.captureHealthFps << ","
         << "\"sensorName\":\"" << oakEscapeJson(status.sensorName) << "\","
         << "\"nativeWidth\":" << status.nativeWidth << ","
         << "\"nativeHeight\":" << status.nativeHeight << ","
@@ -590,7 +789,9 @@ void validateOakCameraConfig(const OakCameraConfig& c) {
        c.frameFreshnessMs < 50 || c.frameFreshnessMs > 60000 ||
        c.noFrameTimeoutMs < c.frameFreshnessMs || c.noFrameTimeoutMs > 60000 ||
        c.reconnectIntervalMs < 1 || c.reconnectMaxIntervalMs < c.reconnectIntervalMs ||
-       c.reconnectMaxIntervalMs > 60000 || c.snapshotDir.empty() || c.recordingDir.empty()) {
+       c.reconnectMaxIntervalMs > 60000 || c.snapshotDir.empty() || c.recordingDir.empty() ||
+       c.depthFps < 1 || c.depthFps > 15 || c.depthJpegQuality < 1 || c.depthJpegQuality > 90 ||
+       c.depthVisualMinMm < 0 || c.depthVisualMaxMm > 65535 || c.depthVisualMaxMm <= c.depthVisualMinMm) {
         throw std::invalid_argument("invalid camera dimensions, FPS, quality, timeout, retry, port or media directory");
     }
 }

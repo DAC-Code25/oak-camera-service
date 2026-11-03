@@ -37,7 +37,8 @@ public:
         cv::cvtColor(cv::Mat(64, 96, CV_8UC3, cv::Scalar(0, 150, 0)), yuv, cv::COLOR_BGR2YUV_I420);
         const auto bytes = std::make_shared<const std::vector<std::uint8_t>>(yuv.data, yuv.data + yuv.total());
         const auto now = std::chrono::steady_clock::now();
-        return {cv::Mat(32, 48, CV_8UC3, cv::Scalar(0, 150, 0)).clone(), bytes, now, bytes, now};
+        OakCaptureFrame result{cv::Mat(32, 48, CV_8UC3, cv::Scalar(0, 150, 0)).clone(), bytes, now, bytes, now};
+        result.healthAt = now; return result;
     }
     OakCaptureInfo info() const override { return {"test-native", 96, 64}; }
     std::string deviceId() const override { return "controlled-test"; }
