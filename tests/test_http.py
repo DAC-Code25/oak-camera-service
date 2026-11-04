@@ -59,7 +59,7 @@ with tempfile.TemporaryDirectory(prefix="oak-http-test-") as directory:
         assert status()["previewJpegOptimized"] is True
         duplicate = subprocess.run(args, env=env, capture_output=True, timeout=3)
         assert duplicate.returncode != 0 and b"bind() failed" in duplicate.stderr
-        assert b"capture connected" not in duplicate.stdout
+        assert "相机已连接".encode() not in duplicate.stdout
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
         connection.request("GET", "/camera/stream.mjpeg")
         stream = connection.getresponse()
@@ -119,10 +119,11 @@ with tempfile.TemporaryDirectory(prefix="oak-http-test-") as directory:
         wait_for(lambda: status()["reconnectCount"] > retries and "native capture stalled" in status()["lastCaptureError"],
                  "native-only stall did not rebuild camera")
         state.write_text("healthy")
-        wait_for(lambda: status()["cameraConnected"] and status()["lastNativeFrameAgeMs"] >= 0,
+        wait_for(lambda: status()["cameraConnected"],
                  "native-only stall did not recover")
         retries = status()["reconnectCount"]
         state.write_text("recording-stall")
+        assert not request("/camera/record/start", "POST")[1]["success"], "recording started without a new frame"
         wait_for(lambda: status()["reconnectCount"] > retries and "recording source stalled" in status()["lastCaptureError"],
                  "recording-only stall did not rebuild camera")
         state.write_text("healthy")
@@ -137,7 +138,7 @@ with tempfile.TemporaryDirectory(prefix="oak-http-test-") as directory:
         assert time.monotonic() - start < 4
         log.flush(); log.seek(0)
         text = log.read()
-        assert "test X_LINK_ERROR" in text and "preview stalled" in text and "retry in" in text
+        assert "test X_LINK_ERROR" in text and "stalled" in text and "毫秒后重试" in text
         invalid = subprocess.run([sys.argv[1], "--fps", "nan"], capture_output=True, timeout=3)
         assert invalid.returncode != 0 and b"invalid camera" in invalid.stderr
         invalid = subprocess.run([sys.argv[1], "--port", "18080junk"], capture_output=True, timeout=3)

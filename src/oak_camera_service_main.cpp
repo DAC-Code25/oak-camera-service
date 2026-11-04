@@ -32,6 +32,13 @@ struct ClientConnection {
 };
 
 std::atomic<bool> gRunning{true};
+std::atomic<int> gMediaStreams{0};
+
+struct StreamSlot {
+    bool acquired = false;
+    StreamSlot() { acquired = gMediaStreams.fetch_add(1) < 4; if(!acquired) --gMediaStreams; }
+    ~StreamSlot() { if(acquired) --gMediaStreams; }
+};
 
 void signalHandler(int) {
     gRunning.store(false);
@@ -82,9 +89,14 @@ std::string makeJsonResponse(OakCameraDevice& camera, const OakStatus& status) {
 }
 
 void handleMjpegStream(int fd, OakCameraDevice& camera, const OakCameraConfig& config) {
+    StreamSlot slot;
+    if(!slot.acquired) {
+        sendTextResponse(fd, 503, "Service Unavailable", "application/json", "{\"success\":false,\"message\":\"实时媒体最多同时连接4个客户端\"}");
+        return;
+    }
     std::uint64_t lastFrameId = 0;
     std::vector<std::uint8_t> jpeg;
-    if(!camera.waitForNextJpeg(0, lastFrameId, jpeg, std::chrono::milliseconds(0))) {
+    if(!camera.waitForNextJpeg(0, lastFrameId, jpeg, std::chrono::milliseconds(1500))) {
         sendTextResponse(fd, 503, "Service Unavailable", "application/json", oakStatusToJson(camera.status()));
         return;
     }
@@ -128,6 +140,48 @@ void handleMjpegStream(int fd, OakCameraDevice& camera, const OakCameraConfig& c
     }
 }
 
+void depthUnavailable(int fd, OakCameraDevice& camera) {
+    auto status = camera.depthStatus(); status["success"] = false;
+    sendTextResponse(fd,503,"Service Unavailable","application/json",oakJsonText(status));
+}
+
+std::string depthImageHeaders(const OakDepthImage& image) {
+    std::ostringstream text;
+    text << "X-Frame-Id: " << image.frameId << "\r\n"
+         << "X-Captured-Monotonic-Ms: " << image.capturedMonotonicMs << "\r\n"
+         << "X-Depth-Unit: millimeter\r\nX-Depth-Invalid-Value: 0\r\n"
+         << "X-Depth-Reference: rectified_left_camera\r\n";
+    return text.str();
+}
+
+void handleDepth(int fd, OakCameraDevice& camera, const OakCameraConfig& config, bool png, bool stream) {
+    StreamSlot slot;
+    if(!slot.acquired) {
+        sendTextResponse(fd,503,"Service Unavailable","application/json","{\"success\":false,\"message\":\"实时媒体最多同时连接4个客户端\"}"); return;
+    }
+    OakDepthImage image;
+    const auto depthWait = std::chrono::milliseconds(std::max(1000, 2000/config.depthFps));
+    if(!camera.waitForDepthImage(png, 0, image, depthWait)) { depthUnavailable(fd,camera); return; }
+    std::ostringstream header;
+    header << "HTTP/1.1 200 OK\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Type: ";
+    if(stream) header << "multipart/x-mixed-replace; boundary=" << config.mjpegBoundary << "\r\n\r\n";
+    else header << (png ? "image/png" : "image/jpeg") << "\r\nContent-Length: " << image.bytes->size() << "\r\n"
+                << depthImageHeaders(image) << "\r\n";
+    const auto text = header.str();
+    if(!sendAll(fd,text.data(),text.size(),MSG_MORE)) return;
+    if(!stream) { sendAll(fd,image.bytes->data(),image.bytes->size()); return; }
+    while(gRunning.load()) {
+        std::ostringstream part;
+        part << "--" << config.mjpegBoundary << "\r\nContent-Type: image/jpeg\r\nContent-Length: " << image.bytes->size()
+             << "\r\n" << depthImageHeaders(image) << "\r\n";
+        const auto partText = part.str();
+        if(!sendAll(fd,partText.data(),partText.size(),MSG_MORE) ||
+           !sendAll(fd,image.bytes->data(),image.bytes->size(),MSG_MORE) || !sendAll(fd,"\r\n",2)) break;
+        const auto previous = image.frameId;
+        if(!camera.waitForDepthImage(false,previous,image,depthWait)) break;
+    }
+}
+
 void handleClient(int fd, OakCameraDevice& camera, const OakCameraConfig& config) {
     try {
     std::string requestBuffer;
@@ -166,23 +220,36 @@ void handleClient(int fd, OakCameraDevice& camera, const OakCameraConfig& config
     if(request.method == "GET" && request.path == "/camera/status") {
         const auto status = camera.status();
         auto v = oakParseJson(makeJsonResponse(camera, status)); v["mediaConfiguration"] = camera.settings();
+        v["depth"] = camera.depthStatus();
         sendTextResponse(fd, 200, "OK", "application/json", oakJsonText(v));
+    } else if(request.method == "GET" && request.path == "/camera/depth/status") {
+        sendTextResponse(fd,200,"OK","application/json",oakJsonText(camera.depthStatus()));
+    } else if(request.method == "GET" && request.path == "/camera/depth/image.png") {
+        handleDepth(fd,camera,config,true,false);
+    } else if(request.method == "GET" && request.path == "/camera/depth/image.jpg") {
+        handleDepth(fd,camera,config,false,false);
+    } else if(request.method == "GET" && request.path == "/camera/depth/stream.mjpeg") {
+        handleDepth(fd,camera,config,false,true);
     } else if(request.method == "GET" && request.path == "/camera/capabilities") {
         sendTextResponse(fd,200,"OK","application/json",oakJsonText(camera.capabilities()));
     } else if(request.method == "GET" && request.path == "/camera/settings") {
         sendTextResponse(fd,200,"OK","application/json",oakJsonText(camera.settings()));
     } else if(request.method == "PUT" && request.path == "/camera/settings") {
         const auto result = camera.updateSettings(oakParseJson(request.body));
+        std::clog << "相机媒体参数更新已受理，修订号=" << result["revision"].asString() << std::endl;
         const bool pending = result["applyState"] == "pending";
         sendTextResponse(fd,pending?202:200,pending?"Accepted":"OK","application/json",oakJsonText(result));
     } else if(request.method == "POST" && request.path == "/camera/photo") {
         const auto status = camera.savePhoto();
+        std::clog << "拍照请求" << (status.success ? "完成" : "失败") << (status.success ? "" : ": "+status.message) << std::endl;
         sendTextResponse(fd, status.success ? 200 : 500, status.success ? "OK" : "Internal Server Error", "application/json", makeJsonResponse(camera, status));
     } else if(request.method == "POST" && request.path == "/camera/record/start") {
         const auto status = camera.startRecording();
+        std::clog << "开始录像请求" << (status.success ? "完成" : "失败") << (status.success ? "" : ": "+status.message) << std::endl;
         sendTextResponse(fd, status.success ? 200 : 500, status.success ? "OK" : "Internal Server Error", "application/json", makeJsonResponse(camera, status));
     } else if(request.method == "POST" && request.path == "/camera/record/stop") {
         const auto status = camera.stopRecording();
+        std::clog << "停止录像请求" << (status.success ? "完成" : "失败") << (status.success ? "" : ": "+status.message) << std::endl;
         sendTextResponse(fd, 200, "OK", "application/json", makeJsonResponse(camera, status));
     } else if(request.method == "GET" && request.path == "/camera/stream.mjpeg") {
         handleMjpegStream(fd, camera, config);
@@ -270,9 +337,20 @@ OakCameraConfig parseConfig(int argc, char** argv) {
             config.reconnectMaxIntervalMs = integer(arg);
         } else if(arg == "--disable-low-latency-profile") {
             config.lowLatencyProfile = false;
+        } else if(arg == "--disable-depth") {
+            config.depthEnabled = false;
+        } else if(arg == "--depth-fps") {
+            config.depthFps = integer(arg);
+        } else if(arg == "--depth-jpeg-quality") {
+            config.depthJpegQuality = integer(arg);
+        } else if(arg == "--depth-visual-min-mm") {
+            config.depthVisualMinMm = integer(arg);
+        } else if(arg == "--depth-visual-max-mm") {
+            config.depthVisualMaxMm = integer(arg);
         } else if(arg == "--help" || arg == "-h") {
             std::cout << "Preview lossless entropy optimization: enabled; use --disable-preview-jpeg-optimization to disable.\n";
             std::cout << "Media settings: [--settings-file FILE] [--sensor-fps FPS] [--record-width W] [--record-height H] [--record-fps FPS] [--photo-fps FPS]. Runtime: GET /camera/capabilities, GET/PUT /camera/settings.\n";
+            std::cout << "Stereo depth: [--disable-depth] [--depth-fps 1..15] [--depth-jpeg-quality 1..90] [--depth-visual-min-mm 300] [--depth-visual-max-mm 10000]. Runtime: GET /camera/depth/status, /image.png (uint16 mm), /image.jpg, /stream.mjpeg.\n";
             std::cout << "Usage: oak_camera_service [--bind ADDR] [--port PORT] [--snapshot-dir DIR] [--recording-dir DIR] [--width W] [--height H] [--fps FPS] [--jpeg-quality N] [--capture-jpeg-quality N] [--recording-crf N] [--disable-low-latency-profile] [--frame-freshness-ms N] [--no-frame-timeout-ms N] [--reconnect-interval-ms N] [--reconnect-max-interval-ms N]\n";
             std::exit(0);
         } else {
@@ -333,6 +411,7 @@ int makeServerSocket(const OakCameraConfig& config) {
 int main(int argc, char** argv) {
     try {
         const auto config = parseConfig(argc, argv);
+        cv::setNumThreads(1); // Keep media processing from claiming navigation CPU cores.
         std::signal(SIGINT, signalHandler);
         std::signal(SIGTERM, signalHandler);
         std::signal(SIGPIPE, SIG_IGN);
@@ -343,7 +422,7 @@ int main(int argc, char** argv) {
         try { camera.start(); }
         catch(...) { ::close(serverFd); throw; }
         std::vector<std::unique_ptr<ClientConnection>> clients;
-        std::cout << "oak_camera_service listening on " << config.bindAddress << ':' << config.port << std::endl;
+        std::cout << "相机服务已启动，监听 " << config.bindAddress << ':' << config.port << std::endl;
 
         while(gRunning.load()) {
             for(auto it = clients.begin(); it != clients.end();) {
@@ -359,7 +438,7 @@ int main(int argc, char** argv) {
                 if(errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                     continue;
                 }
-                std::cerr << "oak_camera_service accept() failed: " << std::strerror(errno) << std::endl;
+                std::cerr << "相机服务接受连接失败: " << std::strerror(errno) << std::endl;
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
@@ -382,9 +461,9 @@ int main(int argc, char** argv) {
                 current->worker = std::thread([current, &camera, &config] {
                     try { handleClient(current->fd, camera, config); }
                     catch(const std::exception& e) {
-                        std::cerr << "camera HTTP client error: " << e.what() << std::endl;
+                        std::cerr << "相机 HTTP 客户端异常: " << e.what() << std::endl;
                     }
-                    catch(...) { std::cerr << "camera HTTP client unknown error" << std::endl; }
+                    catch(...) { std::cerr << "相机 HTTP 客户端未知异常" << std::endl; }
                     {
                         std::lock_guard<std::mutex> lock(current->mutex);
                         ::shutdown(current->fd, SHUT_RDWR);
@@ -397,7 +476,7 @@ int main(int argc, char** argv) {
                 ::close(clientFd);
                 clients.pop_back();
                 gRunning.store(false);
-                std::cerr << "cannot create camera HTTP worker" << std::endl;
+                std::cerr << "无法创建相机 HTTP 工作线程" << std::endl;
             }
         }
 
@@ -408,6 +487,7 @@ int main(int argc, char** argv) {
         }
         camera.stop();
         for(const auto& client : clients) client->worker.join();
+        std::cout << "相机服务已停止" << std::endl;
         return 0;
     } catch(const std::exception& e) {
         std::cerr << "oak_camera_service error: " << e.what() << std::endl;

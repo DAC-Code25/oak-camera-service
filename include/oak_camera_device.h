@@ -36,6 +36,18 @@ struct OakCameraConfig {
     std::string mjpegBoundary = "tenco-oak-boundary";
     OakMediaSettings media;
     std::filesystem::path settingsFile;
+    std::shared_ptr<const OakSettingsDirectoryOps> settingsDirectoryOps;
+    bool depthEnabled = true;
+    int depthFps = 10;
+    int depthJpegQuality = 65;
+    int depthVisualMinMm = 300, depthVisualMaxMm = 10000;
+};
+
+struct OakDepthImage {
+    std::uint64_t frameId = 0;
+    std::int64_t capturedMonotonicMs = 0;
+    int width = 0, height = 0;
+    std::shared_ptr<const std::vector<std::uint8_t>> bytes;
 };
 
 struct OakStatus {
@@ -58,6 +70,9 @@ struct OakStatus {
     std::uint64_t reconnectCount = 0;
     std::uint64_t frameId = 0;
     std::int64_t lastFrameAgeMs = -1;
+    std::uint64_t captureFrameId = 0;
+    std::int64_t lastCaptureFrameAgeMs = -1;
+    int captureHealthFps = 2;
     std::string sensorName;
     int nativeWidth = 0;
     int nativeHeight = 0;
@@ -93,8 +108,12 @@ class OakCameraDevice {
     // Persistence and concurrency checks complete before a pending result is returned.
     Json::Value updateSettings(const Json::Value& request);
 
-    bool waitForNextJpeg(std::uint64_t afterFrameId, std::uint64_t& outFrameId, std::vector<std::uint8_t>& outJpeg, std::chrono::milliseconds timeout) const;
+    bool waitForNextJpeg(std::uint64_t afterFrameId, std::uint64_t& outFrameId, std::vector<std::uint8_t>& outJpeg, std::chrono::milliseconds timeout);
     std::optional<std::vector<std::uint8_t>> latestJpeg() const;
+    Json::Value depthStatus() const;
+    // Requests a short transport lease; encodes each format once per new frame.
+    bool waitForDepthImage(bool png, std::uint64_t afterFrameId, OakDepthImage& result,
+                           std::chrono::milliseconds timeout);
 
   private:
     void runCaptureLoop();
@@ -102,8 +121,11 @@ class OakCameraDevice {
     std::vector<std::uint8_t> encodeJpeg(const cv::Mat& frame) const;
     OakStatus currentStatusLocked() const;
     bool hasFreshFrameLocked() const;
+    bool hasFreshCaptureLocked() const;
     bool hasFreshNativeFrameLocked() const;
     void clearFramesLocked();
+    bool hasFreshDepthLocked() const;
+    Json::Value depthStatusLocked() const;
 
     OakCameraConfig config_;
     OakCaptureFactory factory_;
@@ -113,7 +135,7 @@ class OakCameraDevice {
     std::uint64_t persistedRevision_ = 0;
     bool reconfigure_ = false, hasActiveSettings_ = false;
     std::optional<OakMediaSettings> rollbackSettings_;
-    std::string applyState_ = "pending", settingsError_;
+    std::string applyState_ = "pending", settingsError_, persistenceError_;
     Json::Value settingsLocked() const;
 
     mutable std::mutex mutex_;
@@ -125,6 +147,7 @@ class OakCameraDevice {
 
     bool cameraConnected_ = false;
     bool recording_ = false;
+    bool nativeDemand_ = false;
     std::string lastMessage_ = "not started";
     std::string deviceId_;
     std::string lastPhotoPath_;
@@ -133,13 +156,21 @@ class OakCameraDevice {
     std::uint64_t reconnectCount_ = 0;
     std::string lastCaptureError_;
     std::chrono::steady_clock::time_point lastFrameTime_{};
+    std::chrono::steady_clock::time_point lastCaptureFrameTime_{}, previewDemandUntil_{};
+    std::uint64_t captureFrameId_ = 0;
 
     std::vector<std::uint8_t> latestJpeg_;
     std::shared_ptr<const std::vector<std::uint8_t>> latestNativeYuv_;
     std::chrono::steady_clock::time_point lastNativeFrameTime_{};
     std::chrono::steady_clock::time_point lastRecordingFrameTime_{};
+    std::chrono::steady_clock::time_point recordingDemandStarted_{};
     std::uint64_t nativeFrameId_ = 0;
     OakCaptureInfo captureInfo_;
+    cv::Mat latestDepth_;
+    std::uint64_t depthFrameId_ = 0;
+    std::chrono::steady_clock::time_point lastDepthFrameTime_{}, depthDemandUntil_{};
+    std::mutex depthEncodingMutex_;
+    OakDepthImage cachedDepthPng_, cachedDepthJpeg_;
     OakNativeRecorder writer_;
 };
 

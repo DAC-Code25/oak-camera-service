@@ -71,9 +71,10 @@ Json::Value oakParseJson(const std::string& text) {
 std::string oakJsonText(const Json::Value& v) {
     Json::StreamWriterBuilder b; b["indentation"] = ""; return Json::writeString(b, v);
 }
-void oakPersistSettings(const std::filesystem::path& path, const OakMediaSettings& s, std::uint64_t revision,
-                        const OakMediaSettings* fallback) {
-    if(path.empty()) return;
+OakSettingsPersistence oakPersistSettings(const std::filesystem::path& path, const OakMediaSettings& s,
+                        std::uint64_t revision, const OakMediaSettings* fallback,
+                        const OakSettingsDirectoryOps* directoryOps) {
+    if(path.empty()) return {};
     Json::Value v; v["schemaVersion"] = 1; v["revision"] = std::to_string(revision); v["settings"] = oakSettingsJson(s);
     if(fallback) v["fallbackSettings"] = oakSettingsJson(*fallback);
     const auto data = oakJsonText(v);
@@ -93,6 +94,12 @@ void oakPersistSettings(const std::filesystem::path& path, const OakMediaSetting
     if(error.empty() && ::rename(tmp.c_str(), path.c_str()) < 0) error = std::strerror(errno);
     if(!error.empty()) { ::unlink(tmp.c_str()); throw std::runtime_error("settings persistence failed: " + error); }
     const auto parent = path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
-    const int dir = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
-    if(dir >= 0) { ::fsync(dir); ::close(dir); }
+    const int dir = directoryOps ? directoryOps->open(parent) : ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+    if(dir < 0) return {false, "settings replaced; directory open failed, durability unconfirmed: " + std::string(std::strerror(errno))};
+    const int synced = directoryOps ? directoryOps->sync(dir) : ::fsync(dir);
+    const auto syncError = synced < 0 ? std::string(std::strerror(errno)) : std::string();
+    const int closed = ::close(dir);
+    if(synced < 0) return {false, "settings replaced; directory fsync failed, durability unconfirmed: " + syncError};
+    if(closed < 0) return {false, "settings replaced; directory close failed, durability unconfirmed: " + std::string(std::strerror(errno))};
+    return {true, {}};
 }
