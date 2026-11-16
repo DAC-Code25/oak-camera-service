@@ -15,6 +15,19 @@ spec.loader.exec_module(deployment)
 
 
 class DeployTransactionTest(unittest.TestCase):
+    def test_service_wrapper_requires_exact_runtime_bundle_entrypoint(self):
+        root = Path('/home/nvidia/tenco-project')
+        with patch.object(deployment, 'PROJECT', root):
+            for shell in ('/bin/bash', '/usr/bin/bash'):
+                command = ('path='+shell+' ; argv[]='+shell+' '+
+                           str(root/'runtime/deployment/project.sh')+' run camera isolated ;')
+                self.assertTrue(deployment.check_service_wrapper(command))
+                for invalid in (command.replace(str(root/'runtime/deployment/project.sh'),
+                                                str(root/'src/deployment/project.sh')),
+                                command.replace('run camera isolated', 'run tracking isolated'),
+                                command.replace(str(root), '/another/project')):
+                    self.assertFalse(deployment.check_service_wrapper(invalid))
+
     def test_ready_uses_real_health_frames_when_preview_is_idle(self):
         states = [dict(cameraConnected=True, success=True, frameId=1, lastFrameAgeMs=9000,
                        captureFrameId=value, lastCaptureFrameAgeMs=100) for value in (10, 10, 11, 12)]
@@ -142,7 +155,7 @@ class DeployTransactionTest(unittest.TestCase):
                 drop.write_bytes(b'unknown site override')
             else:
                 drop.symlink_to(project_drop)
-            new_drop.write_text('[Service]\nExecStart=\nExecStart=/bin/bash '+str(root/'src/deployment/project.sh')+' run camera isolated\n')
+            new_drop.write_text('[Service]\nExecStart=\nExecStart=/bin/bash '+str(root/'runtime/deployment/project.sh')+' run camera isolated\n')
             settings.write_bytes(b'old settings')
             business = root/'Capture/business.mp4'; business.parent.mkdir(); business.write_bytes(b'preserved')
             evidence = root/'tmp/evidence.json'
@@ -160,7 +173,7 @@ class DeployTransactionTest(unittest.TestCase):
                 if command[:2] == ['systemctl','show']:
                     if '--property=User,Group' in command:
                         return 'User='+str(os.getuid())+'\nGroup='+str(os.getgid())+'\n'
-                    return 'path=/bin/bash ; argv[]=/bin/bash '+str(root/'src/deployment/project.sh')+' run camera isolated ;'
+                    return 'path=/bin/bash ; argv[]=/bin/bash '+str(root/'runtime/deployment/project.sh')+' run camera isolated ;'
                 if command[0] == 'ffprobe':
                     if 'test-photo.jpg' in command:
                         return json.dumps({'streams':[{'width':4056,'height':3040}]}).encode()
@@ -231,7 +244,7 @@ class DeployTransactionTest(unittest.TestCase):
                 (process/'cgroup').write_text('0::'+group+'\n')
             with patch.multiple(deployment,PROJECT=root,TARGET=target,PROC=proc), \
                  patch.object(deployment.subprocess,'check_output',return_value='/system.slice/camera.service\n'):
-                wrapper='path=/bin/bash ; argv[]=/bin/bash '+str(root/'src/deployment/project.sh')+' run camera isolated ;'
+                wrapper='path=/bin/bash ; argv[]=/bin/bash '+str(root/'runtime/deployment/project.sh')+' run camera isolated ;'
                 self.assertTrue(deployment.check_service_wrapper(wrapper))
                 self.assertFalse(deployment.check_service_wrapper('path='+str(target)+' ;'))
                 self.assertEqual(deployment.running_binary(deployment.digest(target)),(42,deployment.digest(target)))

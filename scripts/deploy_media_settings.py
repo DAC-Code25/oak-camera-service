@@ -175,7 +175,7 @@ def contained(path, parent):
 def check_service_wrapper(command):
     # The logger is systemd's MainPID; the ELF is its owned child. Reject direct
     # binaries or another workspace rather than bypassing the runtime logger.
-    wrapper = str(PROJECT / 'src/deployment/project.sh')
+    wrapper = str(PROJECT / 'runtime/deployment/project.sh')
     return any('path='+shell+' ;' in command and
                'argv[]='+shell+' '+wrapper+' run camera isolated ;' in command
                for shell in ('/bin/bash', '/usr/bin/bash'))
@@ -277,7 +277,7 @@ def deploy(args, binary, transaction_root, evidence_path):
         if not drop_source.is_file():
             raise RuntimeError('project drop-in source is missing')
         starts = [line.strip() for line in drop_source.read_text().splitlines() if line.strip().startswith('ExecStart=')]
-        if starts != ['ExecStart=', 'ExecStart=/bin/bash '+str(PROJECT/'src/deployment/project.sh')+' run camera isolated']:
+        if starts != ['ExecStart=', 'ExecStart=/bin/bash '+str(PROJECT/'runtime/deployment/project.sh')+' run camera isolated']:
             raise RuntimeError('drop-in must preserve the project camera runtime wrapper')
     command = subprocess.check_output(['systemctl', 'show', SERVICE, '-p', 'ExecStart', '--value'], text=True)
     if not check_service_wrapper(command):

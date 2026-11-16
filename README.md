@@ -55,9 +55,9 @@ DepthAI 2.31.1 的 XLinkOut::setFpsLimit 在该设备曾导致停流，当前使
 
 ## 运维和部署
 
-2026-10-17 已统一部署至 `/home/nvidia/tenco-project`：源码为 `oak-camera-service/`，构建为 `build/camera/`，在线程序为 `install/camera/oak_camera_service`，systemd 为 `tenco-oak-camera.service`。照片/录像保存至源码目录的 `Capture/`；旧 `/opt/tenco/media` 的历史媒体移至 `Capture/legacy/` 并保留旧路径兼容链接，保护全部业务媒体。`Capture/`、构建产物和凭据不纳入版本管理。
+2026-10-17 已统一部署至 `/home/nvidia/tenco-project`：开发源码为 `oak-camera-service/`，构建为 `build/camera/`，在线程序为 `install/camera/oak_camera_service`，systemd 为 `tenco-oak-camera.service`。照片/录像固定保存至 `oak-camera-service/Capture/`；二进制发行后该目录作为业务数据目录保留，连同 `camera-settings.json` 保护，不能随 C++ 源码一起删除。旧 `/opt/tenco/media` 的历史媒体移至 `Capture/legacy/` 并保留旧路径兼容链接。`Capture/`、构建产物和凭据不纳入版本管理。
 
-完整服务文件的唯一源码为项目 `src/deployment/tenco-oak-camera.service`，项目 `systemd/` 和 `/etc/systemd/system/` 通过链接加载。仓库的 `systemd/20-native-capture.conf` 可供媒体参数升级事务使用，保持统一启动和日志入口。上线前核对 `systemctl cat tenco-oak-camera.service` 和实际 ExecStart，不从本地文件推断现场版本。在项目根目录可使用 `bash src/deployment/project.sh build-camera`、`test`、`status`；构建不会覆盖 install/ 内的在线程序，部署脚本负责已验证候选的安装切换。
+完整服务模板维护在项目 `src/deployment/tenco-oak-camera.service`，二进制发行安装为项目 `systemd/` 内真实文件，由 `/etc/systemd/system/` 的入口链接加载。2026-11-16 模板与本仓库 `systemd/20-native-capture.conf` 统一使用 `runtime/deployment/project.sh run camera isolated`；主单元与覆盖入口须一起迁移。相机部署事务只接受该运行包 wrapper，继续核对服务 cgroup 中实际相机子进程。上线前核对 `systemctl cat tenco-oak-camera.service` 和实际 ExecStart，不从本地文件推断现场版本。源码环境仍可使用 `bash src/deployment/project.sh build-camera`、`test`、`status`；运行包禁止构建，构建不会覆盖 install/ 内的在线程序。
 
 用户明确要求部署后，在已授权维护窗口使用已验证产物及 SHA256：
 
