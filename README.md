@@ -55,14 +55,14 @@ DepthAI 2.31.1 的 XLinkOut::setFpsLimit 在该设备曾导致停流，当前使
 
 ## 运维和部署
 
-2026-10-17 已统一部署至 `/home/nvidia/tenco-project`：开发源码为 `oak-camera-service/`，构建为 `build/camera/`，在线程序为 `install/camera/oak_camera_service`，systemd 为 `tenco-oak-camera.service`。照片/录像固定保存至 `oak-camera-service/Capture/`；二进制发行后该目录作为业务数据目录保留，连同 `camera-settings.json` 保护，不能随 C++ 源码一起删除。旧 `/opt/tenco/media` 的历史媒体移至 `Capture/legacy/` 并保留旧路径兼容链接。`Capture/`、构建产物和凭据不纳入版本管理。
+工控机统一部署至 `/home/nvidia/tenco-project`，2026-11-16 已改为成套发行包：在线程序为 `install/camera/oak_camera_service`，运行入口为 `runtime/deployment/project.sh`，systemd 为 `tenco-oak-camera.service`。现场已清理相机 C++ 源码和 `build/camera/`；完整源码继续在本机 `oak-camera-service/` 保留。照片/录像固定保存至 `oak-camera-service/Capture/`，连同 `camera-settings.json` 作为业务数据保护，不能随 C++ 源码一起删除。旧 `/opt/tenco/media` 的历史媒体移至 `Capture/legacy/` 并保留旧路径兼容链接。`Capture/`、构建产物和凭据不纳入版本管理。
 
 完整服务模板维护在项目 `src/deployment/tenco-oak-camera.service`，二进制发行安装为项目 `systemd/` 内真实文件，由 `/etc/systemd/system/` 的入口链接加载。2026-11-16 模板与本仓库 `systemd/20-native-capture.conf` 统一使用 `runtime/deployment/project.sh run camera isolated`；主单元与覆盖入口须一起迁移。相机部署事务只接受该运行包 wrapper，继续核对服务 cgroup 中实际相机子进程。上线前核对 `systemctl cat tenco-oak-camera.service` 和实际 ExecStart，不从本地文件推断现场版本。源码环境仍可使用 `bash src/deployment/project.sh build-camera`、`test`、`status`；运行包禁止构建，构建不会覆盖 install/ 内的在线程序。
 
-用户明确要求部署后，在已授权维护窗口使用已验证产物及 SHA256：
+当前整机更新使用 [成套发行包与事务安装](../src/deployment/README.md#二进制发行包与事务安装)，已验证的稳定归档保留在项目 `releases/`。下列单相机脚本仅用于另行准备了本仓库源码及依赖的开发维护环境，不随运行包安装，不能在已清理源码的工控机上直接调用。用户明确要求对应部署后，在已授权维护窗口使用已验证产物及 SHA256：
 
 - `scripts/deploy_verified_service.sh VERIFIED_BINARY SHA256`：拒绝录像中切换，临时保留旧程序、原子安装并重启；调用共用事务的 `--readiness-only` 模式，连续健康/新帧和实际子进程哈希验证后删除临时旧程序，失败先恢复，不创建测试媒体。
-- 媒体参数升级使用 `scripts/deploy_media_settings.py VERIFIED_BINARY SHA256 --drop-in /home/nvidia/tenco-project/oak-camera-service/systemd/20-native-capture.conf --evidence /home/nvidia/tenco-project/tmp/camera-deploy-evidence.json`，以 root 执行；同时验证原生照片、默认录像真实 >=15 FPS、完整解码和配置回退。
+- 媒体参数升级使用 `scripts/deploy_media_settings.py VERIFIED_BINARY SHA256 --drop-in /home/nvidia/tenco-project/systemd/tenco-oak-camera.service.d/20-native-capture.conf --evidence /home/nvidia/tenco-project/tmp/camera-deploy-evidence.json`，以 root 执行；同时验证原生照片、默认录像真实 >=15 FPS、完整解码和配置回退。
 
 部署脚本只接受项目内候选与资源，事务/证据固定存放 `/home/nvidia/tenco-project/tmp`，不使用系统 `/tmp`。服务继续调用 `project.sh run camera isolated`，由统一环境和 runtime logger 启动，RGB 默认参数仍由 project.sh 管理。SHA 校验定位该 systemd ControlGroup 内真正的相机二进制子进程，不把 Python 日志包装器的 MainPID 当成相机。升级 drop-in 时内容安装到项目 `systemd/tenco-oak-camera.service.d/20-native-capture.conf`，`/etc/systemd/system/` 仅保存指向该项目文件的链接；已有未知普通文件或未知链接拒绝覆盖，其他现场 override 不清除。回退恢复原链接、程序和配置，成功后清除项目内事务临时副本。历史 `/opt` 与另一工作空间不属于脚本管理范围。
 
@@ -274,7 +274,7 @@ ffprobe -v error -show_streams -of json /绝对路径/照片.jpg
 
 录像用 `nb_read_frames / duration` 核验平均帧率，必要时逐帧检查时间戳。手机/浏览器播放或扩展名不是编码验证依据。单张JPEG没有视频播放FPS；照片缓冲刷新2FPS不表示每秒自动写2张文件。POST响应丢失的拍照请求不要盲目重拍，应核对实际文件；任务检查点沿用Tenco既有intent/结果确认逻辑。
 
-健康帧龄采用单调时钟；默认1秒，低帧率时按至少1.5个输出周期放宽，避免1FPS配置必然间歇失效。预览、原生照片源、录像源任一路连续5秒无有效帧均会重建；故障清空缓存、停止封装录像，不自动续录。SDK打开/销毁卡死和真实USB插拔恢复、长期混合负载仍需现场单独验收。
+健康帧龄采用单调时钟；默认1秒，低帧率时按至少1.5个输出周期放宽，避免1FPS配置必然间歇失效。已请求输出的预览、原生照片源、录像源任一路连续5秒无有效帧均会重建；未请求的空闲输出不据此判故障。故障清空缓存、停止封装录像，不自动续录。SDK打开/销毁卡死和真实USB插拔恢复、长期混合负载仍需现场单独验收。
 
 ### 8. Tenco位置与服务运维
 
@@ -288,7 +288,7 @@ sudo systemctl stop tenco-oak-camera.service
 journalctl -u tenco-oak-camera.service -n 100 --no-pager
 ```
 
-默认开机启用状态由现有systemd维护；本次不改变启用策略。手动stop会关闭服务，摄像头插拔不能让被显式停止的服务自动启动。相机正常断流/重连可查询status；不要启动第二个程序同时占用同一相机。经验证的本次升级使用 `scripts/deploy_media_settings.py`，同时事务安装二进制/drop-in，验证真实20秒默认媒体≥15FPS后删除临时旧版本；失败恢复原二进制、drop-in、配置。媒体文件始终保留。
+默认开机启用状态由现有systemd维护；本次不改变启用策略。手动stop会关闭服务，摄像头插拔不能让被显式停止的服务自动启动。相机正常断流/重连可查询status；不要启动第二个程序同时占用同一相机。当前升级按前述成套发行包事务进行，安装后另行验证实际进程、持续新帧和受影响媒体功能，再清除临时旧版本；既有单相机脚本仅适用于保留源码的开发维护环境。默认录像≥15FPS的实测结果与保留现场高分辨率设置的性能限制见系统记录，媒体文件始终保留。
 
 ### 实时深度接口
 
