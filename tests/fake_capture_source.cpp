@@ -1,6 +1,7 @@
 #include "oak_camera_device.h"
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <thread>
 
@@ -20,6 +21,20 @@ public:
         depthEnabled_ = config.depthEnabled; depthFps_ = config.depthFps;
         if(mode() == "missing") throw std::runtime_error("test device unavailable");
         if(settings_.recording.width == 80) throw std::runtime_error("test unsupported device configuration");
+        const auto encodedFile = std::getenv("OAK_TEST_ENCODED_FILE");
+        const auto encodedMode = std::getenv("OAK_TEST_RECORDING_ENCODING");
+        if(encodedFile || encodedMode) {
+            if(!encodedFile || !encodedMode) throw std::runtime_error("incomplete test encoded capture configuration");
+            const std::string encoding(encodedMode);
+            if(encoding == "h264") recordingEncoding_ = OakRecordingEncoding::H264;
+            else if(encoding == "mjpeg") recordingEncoding_ = OakRecordingEncoding::Mjpeg;
+            else throw std::runtime_error("invalid test recording encoding");
+            std::ifstream input(encodedFile, std::ios::binary);
+            if(!input) throw std::runtime_error("test encoded frame file unavailable");
+            encodedPayload_ = std::make_shared<const std::vector<std::uint8_t>>(
+                std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+            if(encodedPayload_->empty()) throw std::runtime_error("test encoded frame file empty");
+        }
     }
     OakCaptureFrame read(std::chrono::milliseconds timeout) override {
         std::this_thread::sleep_for(std::min(timeout, std::chrono::milliseconds(20)));
@@ -42,8 +57,14 @@ public:
         const int w = settings_.recording.width ? settings_.recording.width : 96;
         const int h = settings_.recording.height ? settings_.recording.height : 64;
         if(rgbDemand_.recording && current != "recording-stall") {
-            cv::cvtColor(cv::Mat(h, w, CV_8UC3, cv::Scalar(sequence_ % 255, 80, 120)), yuv, cv::COLOR_BGR2YUV_I420);
-            result.recordingYuv = std::make_shared<const std::vector<std::uint8_t>>(yuv.data, yuv.data + yuv.total());
+            if(encodedPayload_) {
+                result.recordingEncoded = current == "recording-invalid" ?
+                    std::make_shared<const std::vector<std::uint8_t>>(4, 0) : encodedPayload_;
+                result.recordingSequence = sequence_;
+            } else {
+                cv::cvtColor(cv::Mat(h, w, CV_8UC3, cv::Scalar(sequence_ % 255, 80, 120)), yuv, cv::COLOR_BGR2YUV_I420);
+                result.recordingYuv = std::make_shared<const std::vector<std::uint8_t>>(yuv.data, yuv.data + yuv.total());
+            }
         }
         if(now-lastHealth_ >= std::chrono::milliseconds(500)) { result.healthAt = now; lastHealth_ = now; }
         if(depthDemand_ && depthEnabled_ && current != "depth-stall" && current != "no-depth" &&
@@ -56,7 +77,9 @@ public:
         }
         return result;
     }
-    OakCaptureInfo info() const override { return {"test-native", 96, 64, 1.42, 30, mode() != "no-depth", 32, 24}; }
+    OakCaptureInfo info() const override {
+        return {"test-native", 96, 64, 1.42, 30, mode() != "no-depth", 32, 24, recordingEncoding_};
+    }
     void setDepthDemand(bool enabled) override { depthDemand_ = enabled; }
     void setRgbDemand(OakRgbDemand demand) override { rgbDemand_ = demand; }
     std::string deviceId() const override { return "test-device"; }
@@ -68,6 +91,8 @@ private:
     std::chrono::steady_clock::time_point lastDepth_{};
     std::chrono::steady_clock::time_point lastHealth_{};
     OakRgbDemand rgbDemand_;
+    OakRecordingEncoding recordingEncoding_ = OakRecordingEncoding::Yuv420p;
+    std::shared_ptr<const std::vector<std::uint8_t>> encodedPayload_;
 };
 }
 std::unique_ptr<OakCaptureSource> makeDepthAiCaptureSource() {

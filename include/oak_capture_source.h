@@ -7,6 +7,7 @@
 #include <vector>
 #include <cstdint>
 #include <opencv2/core.hpp>
+#include "oak_recording_encoding.h"
 
 struct OakCameraConfig;
 
@@ -20,6 +21,8 @@ struct OakCaptureFrame {
     std::chrono::steady_clock::time_point depthAt{};
     // Timestamp of a real, low-bandwidth sensor frame, independent of clients.
     std::chrono::steady_clock::time_point healthAt{};
+    std::shared_ptr<const std::vector<std::uint8_t>> recordingEncoded;
+    std::int64_t recordingSequence = -1;
 };
 
 struct OakRgbDemand {
@@ -33,6 +36,7 @@ struct OakCaptureInfo {
     double minFps = 1.42, maxFps = 30;
     bool depthSupported = false;
     int depthWidth = 0, depthHeight = 0;
+    OakRecordingEncoding recordingEncoding = OakRecordingEncoding::Yuv420p;
 };
 
 // A source belongs exclusively to the capture thread, including destruction.

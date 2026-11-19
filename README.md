@@ -6,7 +6,7 @@
 
 ## 构建与测试
 
-Ubuntu 22.04/Jetson ARM64 已有 DepthAI 2.31.1、OpenCV 4.8；另需 pkg-config、JSONCPP、libavformat/libavcodec/libavutil 开发库及带 libx264 的 FFmpeg，测试需要 ffmpeg/ffprobe。
+Ubuntu 22.04/Jetson ARM64 已有 DepthAI 2.31.1、OpenCV 4.8；另需 pkg-config、JSONCPP、libjpeg、libavformat/libavcodec/libavutil 开发库及带 libx264 的 FFmpeg，测试需要 ffmpeg/ffprobe。目标机使用已有系统 ABI `libjpeg.so.8`。
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_PREFIX_PATH=/opt/ros/humble
@@ -31,19 +31,25 @@ ctest --test-dir build --output-on-failure
 | GET /camera/depth/image.jpg | 便于显示的伪彩色深度图 |
 | GET /camera/depth/stream.mjpeg | 实时伪彩色深度 MJPEG 流 |
 | POST /camera/photo | 保存一张 JPEG |
-| POST /camera/record/start、/stop | 开始录像、停止并封装 MP4 |
+| POST /camera/record/start、/stop | 开始录像、停止并封装 MP4/MKV/MOV |
 
-默认 IMX378 原生输入 4056×3040@30；预览 960×540@15/JPEG70；照片原生 JPEG90/源 2 FPS；录像 1280×720@30 目标/H.264 yuv420p MP4。预览/照片/录像可独立调整，比例不符时保留完整视野补黑边。照片 FPS 指源刷新，不代表自动批量保存。原生 12MP 录像可选但不保证 15 FPS，默认低分辨率档位按真实文件 FPS 和完整解码验收。
+默认 IMX378 原生输入 4056×3040@30；预览 960×540@15/JPEG70；照片原生 JPEG90/源 2 FPS；录像 1280×720@30 目标/H.264 yuv420p MP4。预览/照片/录像可独立调整，比例不符时保留完整视野补黑边。照片 FPS 指源刷新，不代表自动批量保存。录像目标为 720p 30 FPS、更高分辨率至少 25 FPS；按真实文件帧数、采集时间戳及完整解码验收，不能以目标值代替实测。
 
 PUT 使用 expectedRevision，原子持久化后返回 202，GET 区分 pending/applied/rejected 和 activeSettings。采集线程重建应用配置，HTTP 不等待 SDK 打开/销毁；失败恢复上一有效配置，应用中退出也保留 fallback。录像中或未就绪拒绝改参，客户端不能在启动或本地保存时覆盖设备设置。
 
-RGB 预览、原生照片和录像在设备端按需开启：预览订阅续期 2 秒，照片请求等待请求之后的新原生帧，录像先准备编码器再开启传输，首帧提交后返回成功。启动或改参时三路各验证新帧，此后空闲只以最高 2 Hz 传输真实 ISP 帧元数据（无像素），不缩放图像、不做 JPEG 编码；状态查询不会隐式启动视频。`cameraConnected` 按该健康流新鲜度判断，`captureFrameId` / `lastCaptureFrameAgeMs` / `captureHealthFps` 供远程启动持续验证，既有 `frameId` / `lastFrameAgeMs` 仍专指预览。
+RGB 预览、原生照片和录像在设备端按需开启：预览订阅续期 2 秒，照片请求等待请求之后的新原生帧，录像先准备编码器再开启传输，首个可解码帧写入封装后返回成功。启动或改参时三路各验证新帧，此后空闲只以最高 2 Hz 传输真实 ISP 帧元数据（无像素），不缩放图像、不做 JPEG 编码；状态查询不会隐式启动视频。`cameraConnected` 按该健康流新鲜度判断，`captureFrameId` / `lastCaptureFrameAgeMs` / `captureHealthFps` 供远程启动持续验证，既有 `frameId` / `lastFrameAgeMs` 仍专指预览。
 
 仅对已请求的照片/录像/预览检查对应断流；健康流持续检查。默认连续 5 秒无帧重建，正常帧新鲜度默认 1 秒，低 FPS 按至少 1.5 个输出周期放宽。失败退避 1/2/4/8/10 秒，健康 5 秒复位。未连接/旧缓存流返回 503；采集故障关闭录像，恢复后不自动续录。没有订阅者时预览帧号停止递增属于正常空闲，不应据此重启相机。
 
 设置 `persisted=true` 仅在文件和父目录同步均确认后成立。rename 后目录 open/fsync 失败仍跟随已经可见的新 revision 应用及恢复 fallback，但返回 `persistenceState=unconfirmed`、`persisted=false` 和 `persistenceError`，不把运行生效宣称为断电持久化已确认；未设置配置文件时为 `memory_only`。
 
-录像使用真实时间戳，不填重复帧；编码队列最多 3 帧，满时丢最旧帧并统计，默认 CRF23/4 线程。状态和预览不等待磁盘封装；正常停止等待有界队列并封装，分片降低异常退出影响，不承诺断电零丢失。
+录像在 OAK 设备内编码，工控机保序接收压缩帧，按真实采集时间封装，不填重复帧。宽度按 32 对齐且吞吐不超过 124.416 MPix/s 时使用 H.264/MP4（包含 720p/1080p30）；更大尺寸使用 MJPEG/MKV、质量 90，为预览和深度并行留出编码余量。4K30 不再贴着 H.264 的 248.832 MPix/s 硬件上限运行；MJPEG 的设备预算为 450 MPix/s。硬件预算来自 [Luxonis VideoEncoder](https://docs.luxonis.com/software/depthai-components/nodes/video_encoder/)，实际帧率仍以文件验收。
+
+2028×1520 等非 32 对齐尺寸只在右侧增加编码边界，主机以 JPEG 系数无损去除附加边界，保留请求尺寸和完整视野。4056×3040 原生录像在设备中顺时针转置为 3040×4056 编码，以绕过 ImageManip 最大宽 4056 与编码器宽度对齐的冲突；MOV 保存 90° 显示矩阵，支持方向矩阵的播放器恢复为 4056×3040。原生 JPEG 照片仍为正向 4056×3040；该录像路径不裁剪原画面，也不在主机重新编码 JPEG。MJPEG 文件通常明显大于 H.264。`recordingCodec`、`recordingContainer`、`recordingEncoder`、`recordingDisplayRotation` 在能力接口报告当前配置格式，在状态接口报告最近录像格式；设置仍由同一 GET/PUT 接口管理。
+
+编码后设备和 USB 队列保序，主机每次取一帧；H.264 写盘队列最多 64 包/64 MiB，满时明确结束录像并报告错误，避免丢参考帧后生成损坏视频。MJPEG 和原始帧队列最多 3 帧，满时丢最旧帧并统计。假采集源/原始 YUV 接口保留 libx264 ultrafast/CRF23/4 线程路径，引用原始帧避免额外逐行复制；CRF 只对该软件路径有效。时间戳使用微秒精度，逆序/重复采集时间明确失败；每帧持续时间按相邻采集时间确定。H.264 开始时等待 SPS/PPS 和 IDR，不从中间预测帧开始存档。状态不等待磁盘封装；停止等待队列封装，MP4 分片降低异常退出影响，不承诺断电零丢失。
+
+预览以 YUV420 在设备缩放、通过 USB 传输，工控机转换颜色，减少设备计算并将预览原始传输量减半。预览 JPEG 在独立工作线程编码，最多保留一个待处理图像，慢预览不阻塞录像取包。设备按传感器序号选帧，同帧率直接放行，减少脚本执行时刻对真实帧的影响。
 
 status 保留 frameId、lastFrameAgeMs、reconnectCount、lastCaptureError、原生帧龄和尺寸、recordingActualFps/recordingDroppedFrames/lastRecordingError、mediaConfiguration 等诊断。previewJpegOptimized 表示预览 Huffman 优化，默认开启，可用 `--disable-preview-jpeg-optimization` 关闭；不改变照片/录像或 settings revision。同输入编码历史减少约 4%，不是所有无线场景带宽收益的承诺。
 
@@ -62,7 +68,7 @@ DepthAI 2.31.1 的 XLinkOut::setFpsLimit 在该设备曾导致停流，当前使
 当前整机更新使用 [成套发行包与事务安装](../src/deployment/README.md#二进制发行包与事务安装)，已验证的稳定归档保留在项目 `releases/`。下列单相机脚本仅用于另行准备了本仓库源码及依赖的开发维护环境，不随运行包安装，不能在已清理源码的工控机上直接调用。用户明确要求对应部署后，在已授权维护窗口使用已验证产物及 SHA256：
 
 - `scripts/deploy_verified_service.sh VERIFIED_BINARY SHA256`：拒绝录像中切换，临时保留旧程序、原子安装并重启；调用共用事务的 `--readiness-only` 模式，连续健康/新帧和实际子进程哈希验证后删除临时旧程序，失败先恢复，不创建测试媒体。
-- 媒体参数升级使用 `scripts/deploy_media_settings.py VERIFIED_BINARY SHA256 --drop-in /home/nvidia/tenco-project/systemd/tenco-oak-camera.service.d/20-native-capture.conf --evidence /home/nvidia/tenco-project/tmp/camera-deploy-evidence.json`，以 root 执行；同时验证原生照片、默认录像真实 >=15 FPS、完整解码和配置回退。
+- 媒体参数升级使用 `scripts/deploy_media_settings.py VERIFIED_BINARY SHA256 --drop-in /home/nvidia/tenco-project/systemd/tenco-oak-camera.service.d/20-native-capture.conf --evidence /home/nvidia/tenco-project/tmp/camera-deploy-evidence.json`，以 root 执行；同时验证原生照片、默认录像真实 >=29.7 FPS（30 Hz 允许 1% 时钟偏差）、完整解码和配置回退。
 
 部署脚本只接受项目内候选与资源，事务/证据固定存放 `/home/nvidia/tenco-project/tmp`，不使用系统 `/tmp`。服务继续调用 `project.sh run camera isolated`，由统一环境和 runtime logger 启动，RGB 默认参数仍由 project.sh 管理。SHA 校验定位该 systemd ControlGroup 内真正的相机二进制子进程，不把 Python 日志包装器的 MainPID 当成相机。升级 drop-in 时内容安装到项目 `systemd/tenco-oak-camera.service.d/20-native-capture.conf`，`/etc/systemd/system/` 仅保存指向该项目文件的链接；已有未知普通文件或未知链接拒绝覆盖，其他现场 override 不清除。回退恢复原链接、程序和配置，成功后清除项目内事务临时副本。历史 `/opt` 与另一工作空间不属于脚本管理范围。
 
@@ -83,11 +89,11 @@ IMX378 实测原生传感器模式为 **4056×3040，1.42～30 FPS**。默认始
 | 传感器输入 | 4056×3040 | 30 | 原生模式输入；实际能力以 capabilities 为准 |
 | MJPEG 预览 | 960×540 | 15 | 预览输出，不决定照片或录像存档尺寸 |
 | JPEG 照片 | 原生 4056×3040 | 2 | FPS 为照片源缓冲刷新率；POST 一次只保存一张照片 |
-| MP4 录像 | 1280×720 | 30 | H.264/yuv420p、真实帧时间戳；默认档位按实际保存 ≥15 FPS 验证 |
+| MP4 录像 | 1280×720 | 30 | H.264/yuv420p、真实帧时间戳；默认档位按实际保存 ≥29.7 FPS 验证（30 Hz 的 1% 时钟偏差） |
 
-照片质量90，录像 libx264 superfast/CRF23。照片和录像保存在 `/home/nvidia/tenco-project/oak-camera-service/Capture`。返回的 `path` 是工控机绝对路径，接口不传输整个媒体文件，也不自动下载到上位机。
+照片质量90，物理录像按尺寸采用 OAK H.264 或 MJPEG 硬件编码。照片和录像保存在 `/home/nvidia/tenco-project/oak-camera-service/Capture`。返回的 `path` 是工控机绝对路径，接口不传输整个媒体文件，也不自动下载到上位机。
 
-历史真机测试结果见 CHANGELOG。目标帧率是选帧上限，并不保证任意尺寸、光照或混合负载均能达到该值；原生12MP软件录像此前约4～5 FPS，选择原生尺寸不保证15 FPS。服务不复制旧帧填帧，不用修改容器帧率加速播放。
+真机测试结果与已部署版本见 CHANGELOG。目标帧率是选帧上限，并不保证任意尺寸、光照或混合负载均能达到该值；原生 12MP 软件录像历史约 4～5 FPS，转置后的设备 MJPEG 路径仍未达到 25 FPS。服务不复制旧帧填帧，不用修改容器帧率加速播放。
 
 所有缩放保留完整视野和宽高比，目标比例不一致时补黑边，不拉伸、不裁剪。原生4:3保存为1280×720时会有左右黑边；可选1280×960保持近似原生比例。照片的 `width=0,height=0` 表示原生尺寸，录像也支持该选择；预览不能为0。宽高必须同时为0或同时为正偶数，正数至少32，不超过实际原生尺寸；预览另限1920×1080。接口也接受满足限制的自定义尺寸，SDK不能实际建立时会报告拒绝并回退。
 
@@ -101,7 +107,7 @@ IMX378 实测原生传感器模式为 **4056×3040，1.42～30 FPS**。默认始
 | GET | `/camera/status` | 采集健康、帧龄、录像状态、实际帧率/丢帧和参数快照 |
 | GET | `/camera/stream.mjpeg` | 连续MJPEG预览；断线后客户端重连 |
 | POST | `/camera/photo` | 按当前照片尺寸保存一张JPEG |
-| POST | `/camera/record/start` | 按当前录像尺寸/FPS开始MP4 |
+| POST | `/camera/record/start` | 按当前录像尺寸/FPS和实际编码开始录像 |
 | POST | `/camera/record/stop` | 停止并封装MP4，检查业务success字段 |
 
 请求、响应均为UTF-8 JSON；PUT带 `Content-Type: application/json` 和正确 `Content-Length`。不支持分块上传，正文上限16KiB、头部8KiB，socket读写空闲超时2秒，最多16个客户连接。当前服务使用既有HTTP访问方式，没有新增鉴权/HTTPS；访问范围沿现场网络管理策略配置。接口不是浏览器跨域SDK。
@@ -158,7 +164,7 @@ settings示例：
 
 `revision`/`activeRevision`为十进制**字符串**，避免不同语言的64位数字精度差异。`settings`为当前请求/回退后配置；`activeSettings`为已收到有效帧的配置，第一次启动尚未生效时为null。`pending`期间旧activeSettings不表示新请求已生效。`persisted=true`表示该版本的文件及父目录同步已确认，不代表已应用。rename 后目录 open/fsync 失败时新 revision 已可见，返回 `persistenceState=unconfirmed`、`persisted=false` 和 `persistenceError`，仍按该 revision 应用/回退，不能以成功 HTTP 状态推断断电持久化已确认；未设置文件时为 `memory_only`。`cameraConnected`与`recording`是读时状态，写操作仍会重新核验。
 
-预览、照片、录像均按需传输。空闲以最高 2 Hz 保留真实 ISP 帧元数据（不传像素、不缩放），`captureFrameId`、`lastCaptureFrameAgeMs`、`captureHealthFps` 用于采集健康和远程启动检查；`frameId` 仍为预览 JPEG 计数，没有订阅时可不增长。照片等待本次请求之后的新原生帧；录像先准备 writer，再开启输出并提交首帧后返回。`previewTransportActive` / `nativeTransportActive` / `recordingTransportActive` 为设置响应里的当前需求快照，启动/重配的短暂三路验证另行进行。
+预览、照片、录像均按需传输。空闲以最高 2 Hz 保留真实 ISP 帧元数据（不传像素、不缩放），`captureFrameId`、`lastCaptureFrameAgeMs`、`captureHealthFps` 用于采集健康和远程启动检查；`frameId` 仍为预览 JPEG 计数，没有订阅时可不增长。照片等待本次请求之后的新原生帧；录像先准备 writer，再开启输出，等首个可解码帧写入后返回。`previewTransportActive` / `nativeTransportActive` / `recordingTransportActive` 为设置响应里的当前需求快照，启动/重配的短暂三路验证另行进行。
 
 ### 4. 修改：先读版本，再PUT，最后回读
 
@@ -262,7 +268,7 @@ curl --noproxy '*' -fsS "$BASE/camera/status" | python3 -m json.tool
 curl --noproxy '*' -fsS -X POST "$BASE/camera/record/stop" -H 'Content-Type: application/json' -d '{}'
 ```
 
-`recordingActualFps`按已编码帧数和真实采集时间跨度估算，是本次录像累计平均值，不是传感器配置值/瞬时吞吐；停止后保留最近统计，开始新录像清零。`recordingFrames`为已写入帧，`recordingDroppedFrames`为有界编码队列丢弃帧；设备或USB上游未输出的帧不计入该丢帧数。因此丢帧0不等于达到目标FPS。
+`recordingActualFps`按已封装帧数和真实采集时间跨度估算，是本次录像累计平均值，不是传感器配置值/瞬时吞吐；停止后保留最近统计，开始新录像清零。`recordingFrames`为已写入帧，`recordingDroppedFrames`为有界编码队列丢弃帧；设备或USB上游未输出的帧不计入该丢帧数。因此丢帧0不等于达到目标FPS。
 
 以返回path核验实际媒体，勿仅检查 `r_frame_rate`：
 
@@ -271,6 +277,16 @@ ffprobe -v error -count_frames -show_streams -show_format -of json /绝对路径
 ffmpeg -v error -xerror -i /绝对路径/录像.mp4 -f null -
 ffprobe -v error -show_streams -of json /绝对路径/照片.jpg
 ```
+
+现场验收工具在工控机运行，先通过现有设置接口明确选择待测尺寸并确认 applied，再执行：
+
+```bash
+python3 scripts/recording_acceptance.py --seconds 30 --report /home/nvidia/tenco-project/tmp/recording-acceptance.json
+```
+
+工具只录制当前配置，不改参数、不重启服务，拒绝接管已有录像，保留测试媒体及 JSON 报告。30 Hz 的 720p 允许 1% 传感器时钟偏差，最低 29.7 实际 FPS；更高分辨率最低 25 实际 FPS。检查真实解码帧数、逐帧时间戳、文件总时长及完整解码，报告最大帧间隔与缺帧估计；高分辨率测试应配置 30 FPS 留出余量。正式性能验收应覆盖无线预览、照片、深度及生产进程的持续混合负载。
+
+验收同时报告编码尺寸、显示尺寸和方向矩阵；仅真实 Display Matrix 的精确 ±90° 旋转允许交换显示宽高。FFmpeg 按默认自动旋转完整解码，不能仅改流的宽高元数据冒充请求尺寸。
 
 录像用 `nb_read_frames / duration` 核验平均帧率，必要时逐帧检查时间戳。手机/浏览器播放或扩展名不是编码验证依据。单张JPEG没有视频播放FPS；照片缓冲刷新2FPS不表示每秒自动写2张文件。POST响应丢失的拍照请求不要盲目重拍，应核对实际文件；任务检查点沿用Tenco既有intent/结果确认逻辑。
 
@@ -288,7 +304,7 @@ sudo systemctl stop tenco-oak-camera.service
 journalctl -u tenco-oak-camera.service -n 100 --no-pager
 ```
 
-默认开机启用状态由现有systemd维护；本次不改变启用策略。手动stop会关闭服务，摄像头插拔不能让被显式停止的服务自动启动。相机正常断流/重连可查询status；不要启动第二个程序同时占用同一相机。当前升级按前述成套发行包事务进行，安装后另行验证实际进程、持续新帧和受影响媒体功能，再清除临时旧版本；既有单相机脚本仅适用于保留源码的开发维护环境。默认录像≥15FPS的实测结果与保留现场高分辨率设置的性能限制见系统记录，媒体文件始终保留。
+默认开机启用状态由现有systemd维护；本次不改变启用策略。手动stop会关闭服务，摄像头插拔不能让被显式停止的服务自动启动。相机正常断流/重连可查询status；不要启动第二个程序同时占用同一相机。当前升级按前述成套发行包事务进行，安装后另行验证实际进程、持续新帧和受影响媒体功能，再清除临时旧版本；既有单相机脚本仅适用于保留源码的开发维护环境。历史版本的实测结果与现场高分辨率限制见系统记录，媒体文件始终保留。
 
 ### 实时深度接口
 

@@ -80,6 +80,8 @@ struct OakStatus {
     int recordingCrf = 0;
     std::string recordingCodec = "h264";
     std::string recordingContainer = "mp4";
+    int recordingDisplayRotation = 0;
+    std::string recordingEncoder = "host_libx264";
     std::int64_t lastNativeFrameAgeMs = -1;
     std::uint64_t nativeFrameId = 0;
     std::uint64_t recordingFrames = 0;
@@ -152,6 +154,7 @@ class OakCameraDevice {
     std::string deviceId_;
     std::string lastPhotoPath_;
     std::string lastRecordingPath_;
+    std::optional<OakRecordingEncoding> lastRecordingEncoding_;
     std::uint64_t frameId_ = 0;
     std::uint64_t reconnectCount_ = 0;
     std::string lastCaptureError_;
