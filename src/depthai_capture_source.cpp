@@ -1,10 +1,14 @@
 #include "oak_capture_source.h"
 #include "oak_camera_device.h"
+#include "oak_rgb_gate_script.h"
+#include "oak_h264_headers.h"
 
 #include <depthai/depthai.hpp>
+#include <opencv2/imgproc.hpp>
 #include <stdexcept>
 #include <thread>
 #include <algorithm>
+#include <cmath>
 
 namespace {
 class DepthAiCaptureSource final : public OakCaptureSource {
@@ -68,8 +72,9 @@ public:
             throw std::runtime_error("unsupported native color sensor mode: " + info_.sensorName);
         }
         camera->setIspScale(1, 1);
-        // Three consumers may retain different native frames.
-        camera->setIspNumFramesPool(8);
+        // Bounded consumers share ISP frames. Eight native 12MP buffers alone
+        // exhaust DDR when high-resolution encoding and stereo are enabled.
+        camera->setIspNumFramesPool(4);
         validateOakMediaSettings(config.media, &info_);
         camera->setFps(config.media.sensorFps);
         auto rgbControl = pipeline.create<dai::node::XLinkIn>();
@@ -79,15 +84,11 @@ public:
             // streams on this IMX378. Select whole frames before resize/USB.
             auto script = pipeline.create<dai::node::Script>();
             script->inputs["in"].setQueueSize(1); script->inputs["in"].setBlocking(false);
-            std::string demand = "";
             if(demandIndex >= 0) {
                 script->inputs["control"].setQueueSize(1); script->inputs["control"].setBlocking(false);
                 rgbControl->out.link(script->inputs["control"]);
-                demand = "    control = node.io['control'].tryGet()\n    if control is not None:\n        enabled = control.getData()[" + std::to_string(demandIndex) + "] == 1\n";
             }
-            script->setScript("import time\nnext_at = 0.0\nenabled = " + std::string(demandIndex < 0 ? "True" : "False") +
-                "\nwhile True:\n    frame = node.io['in'].get()\n" + demand +
-                "    now = time.monotonic()\n    if enabled and now >= next_at:\n        node.io['out'].send(frame)\n        next_at = max(next_at + " + std::to_string(1.0/fps) + ", now)\n");
+            script->setScript(oakRgbGateScript(fps, config.media.sensorFps, demandIndex));
             camera->isp.link(script->inputs["in"]);
             return script->outputs["out"];
         };
@@ -95,7 +96,8 @@ public:
             auto manip = pipeline.create<dai::node::ImageManip>();
             manip->initialConfig.setResizeThumbnail(settings.width, settings.height);
             manip->initialConfig.setFrameType(type);
-            manip->setMaxOutputFrameSize(settings.width*settings.height*3);
+            manip->setMaxOutputFrameSize(settings.width*settings.height*3/2);
+            manip->setNumFramesPool(2);
             manip->inputImage.setQueueSize(1); manip->inputImage.setBlocking(false);
             gate(settings.fps, demandIndex).link(manip->inputImage);
             auto output = pipeline.create<dai::node::XLinkOut>();
@@ -111,26 +113,106 @@ public:
         healthOutput->setMetadataOnly(true);
         healthOutput->input.setQueueSize(1); healthOutput->input.setBlocking(false);
         gate(2, -1).link(healthOutput->input);
-        resized("preview", config.media.preview, dai::ImgFrame::Type::BGR888p, 0);
+        // Keep YUV through device resize and USB; host conversion frees shared
+        // OAK color-conversion resources and halves preview transport traffic.
+        resized("preview", config.media.preview, dai::ImgFrame::Type::YUV420p, 0);
         auto nativeOutput = pipeline.create<dai::node::XLinkOut>();
         nativeOutput->setStreamName("native");
         nativeOutput->input.setQueueSize(1);
         nativeOutput->input.setBlocking(false);
-        // Native width 4056 is not divisible by the device encoder's required 32.
-        // Transport ISP YUV420 directly over USB3 without cropping or resizing.
+        // Photos retain untouched native ISP pixels, independently of the
+        // compressed recording path.
         gate(config.media.photo.fps, 1).link(nativeOutput->input);
         recordingWidth_ = config.media.recording.width ? config.media.recording.width : info_.nativeWidth;
         recordingHeight_ = config.media.recording.height ? config.media.recording.height : info_.nativeHeight;
-        if(recordingWidth_ == info_.nativeWidth && recordingHeight_ == info_.nativeHeight) {
-            auto recording = pipeline.create<dai::node::XLinkOut>();
-            recording->setStreamName("recording");
-            recording->input.setQueueSize(1); recording->input.setBlocking(false);
-            gate(config.media.recording.fps, 2).link(recording->input);
-        } else resized("recording", config.media.recording, dai::ImgFrame::Type::YUV420p, 2);
+        recordingEncodedWidth_ = (recordingWidth_ + 31) / 32 * 32;
+        // A 4056px native image cannot be padded to 4064: ImageManip's maximum
+        // output width is 4056. A clockwise quarter-turn instead gives a
+        // 32-aligned 3040px JPEG width; MOV restores the upright display without
+        // cropping pixels or re-encoding on the host.
+        const bool rotated = recordingEncodedWidth_ > 4056 && recordingHeight_ % 32 == 0;
+        recordingEncodedHeight_ = rotated ? recordingWidth_ : recordingHeight_;
+        if(rotated) recordingEncodedWidth_ = recordingHeight_;
+        const double pixelsPerSecond = static_cast<double>(recordingEncodedWidth_) * recordingEncodedHeight_ * config.media.recording.fps;
+        if(recordingEncodedWidth_ > 4056)
+            throw std::runtime_error("recording width cannot satisfy device encoder alignment within ImageManip's 4056px limit");
+        // Leave headroom below the H264 4K30 limit when preview and stereo run
+        // concurrently. Large outputs use the higher-throughput MJPEG profile.
+        const bool h264 = !rotated && recordingWidth_ % 32 == 0 && recordingWidth_ <= 4096 && pixelsPerSecond <= 124416000;
+        if(!h264 && pixelsPerSecond > 450000000)
+            throw std::runtime_error("recording dimensions and FPS exceed device MJPEG encoder throughput");
+        info_.recordingEncoding = rotated ? OakRecordingEncoding::MjpegRotated :
+            h264 ? OakRecordingEncoding::H264 : OakRecordingEncoding::Mjpeg;
+        auto recordingManip = pipeline.create<dai::node::ImageManip>();
+        if(rotated) {
+            const double scale = std::min(static_cast<double>(recordingWidth_) / info_.nativeWidth,
+                                          static_cast<double>(recordingHeight_) / info_.nativeHeight);
+            const double ox = (recordingWidth_ - info_.nativeWidth * scale) / 2;
+            const double oy = (recordingHeight_ - info_.nativeHeight * scale) / 2;
+            const auto x0 = static_cast<float>(-ox / scale / info_.nativeWidth);
+            const auto x1 = static_cast<float>((recordingWidth_ - ox) / scale / info_.nativeWidth);
+            const auto y0 = static_cast<float>(-oy / scale / info_.nativeHeight);
+            const auto y1 = static_cast<float>((recordingHeight_ - oy) / scale / info_.nativeHeight);
+            recordingManip->initialConfig.setWarpTransformFourPoints({{x0,y1},{x0,y0},{x1,y0},{x1,y1}}, true);
+            recordingManip->initialConfig.setResize(recordingEncodedWidth_, recordingEncodedHeight_);
+            recordingManip->initialConfig.setWarpBorderFillColor(0, 0, 0);
+        } else if(recordingEncodedWidth_ != recordingWidth_) {
+            // Right-only padding for the firmware's MJPEG width alignment.
+            // The host removes only this border using JPEG coefficients.
+            // Inverse mapping retains the requested complete-FOV letterbox and
+            // leaves its original pixels at their original output positions.
+            const double scale = std::min(static_cast<double>(recordingWidth_) / info_.nativeWidth,
+                                          static_cast<double>(recordingHeight_) / info_.nativeHeight);
+            const double ox = (recordingWidth_ - info_.nativeWidth * scale) / 2;
+            const double oy = (recordingHeight_ - info_.nativeHeight * scale) / 2;
+            const auto x0 = static_cast<float>(-ox / scale / info_.nativeWidth);
+            const auto x1 = static_cast<float>((recordingEncodedWidth_ - ox) / scale / info_.nativeWidth);
+            const auto y0 = static_cast<float>(-oy / scale / info_.nativeHeight);
+            const auto y1 = static_cast<float>((recordingHeight_ - oy) / scale / info_.nativeHeight);
+            recordingManip->initialConfig.setWarpTransformFourPoints({{x0,y0},{x1,y0},{x1,y1},{x0,y1}}, true);
+            recordingManip->initialConfig.setResize(recordingEncodedWidth_, recordingHeight_);
+            recordingManip->initialConfig.setWarpBorderFillColor(0, 0, 0);
+        // NV12 conversion alone preserves every native pixel for aligned native
+        // sizes. Other aligned sizes use the established complete-FOV resize.
+        } else if(recordingWidth_ != info_.nativeWidth || recordingHeight_ != info_.nativeHeight) {
+            recordingManip->initialConfig.setResizeThumbnail(recordingWidth_, recordingHeight_);
+        }
+        recordingManip->initialConfig.setFrameType(dai::ImgFrame::Type::NV12);
+        recordingManip->setMaxOutputFrameSize(recordingEncodedWidth_ * recordingEncodedHeight_ * 3 / 2);
+        recordingManip->setNumFramesPool(4);
+        // Dropping before encoding is safe. Keep native ISP references bounded
+        // so recorder back pressure cannot exhaust the camera's frame pool.
+        recordingManip->inputImage.setQueueSize(1); recordingManip->inputImage.setBlocking(false);
+        gate(config.media.recording.fps, 2).link(recordingManip->inputImage);
+        auto recordingEncoder = pipeline.create<dai::node::VideoEncoder>();
+        recordingEncoder->setDefaultProfilePreset(config.media.recording.fps,
+            h264 ? dai::VideoEncoderProperties::Profile::H264_MAIN : dai::VideoEncoderProperties::Profile::MJPEG);
+        recordingEncoder->setNumFramesPool(2);
+        // The automatic bitstream slots reserve raw NV12-sized buffers. Keep a
+        // generous compressed-frame allowance without starving the NV12 pool.
+        recordingEncoder->setMaxOutputFrameSize(h264 ? 4 * 1024 * 1024 :
+            std::max(4 * 1024 * 1024, recordingEncodedWidth_ * recordingEncodedHeight_));
+        recordingEncoder->input.setQueueSize(4); recordingEncoder->input.setBlocking(true);
+        if(h264) {
+            recordingEncoder->setNumBFrames(0);
+            recordingEncoder->setKeyframeFrequency(std::max(1, static_cast<int>(std::lround(config.media.recording.fps))));
+            recordingEncoder->setBitrate(static_cast<int>(std::max(2000000.0, pixelsPerSecond * 0.16)));
+        } else {
+            recordingEncoder->setQuality(90);
+        }
+        recordingManip->out.link(recordingEncoder->input);
+        auto recordingOutput = pipeline.create<dai::node::XLinkOut>();
+        recordingOutput->setStreamName("recording");
+        // Encoded H264 packets contain references to earlier packets: bounded
+        // queues apply back pressure instead of discarding those references.
+        // The gate's latest-only ISP input still keeps this branch independent
+        // of preview, photos and sensor-health delivery.
+        recordingOutput->input.setQueueSize(8); recordingOutput->input.setBlocking(true);
+        recordingEncoder->bitstream.link(recordingOutput->input);
         device_->startPipeline(pipeline);
         queue_ = device_->getOutputQueue("preview", 2, false);
         nativeQueue_ = device_->getOutputQueue("native", 2, false);
-        recordingQueue_ = device_->getOutputQueue("recording", 2, false);
+        recordingQueue_ = device_->getOutputQueue("recording", 16, true);
         healthQueue_ = device_->getOutputQueue("health", 1, false);
         rgbControl_ = device_->getInputQueue("rgb-demand", 1, false);
         if(config.depthEnabled && info_.depthSupported) {
@@ -176,24 +258,26 @@ public:
             result.nativeYuv = std::make_shared<const std::vector<std::uint8_t>>(std::move(native->getData()));
             result.capturedAt = native->getTimestamp();
         }
-        if(auto video = latest(recordingQueue_)) {
-            if(video->getWidth() != static_cast<unsigned>(recordingWidth_) ||
-               video->getHeight() != static_cast<unsigned>(recordingHeight_) ||
-               video->getType() != dai::ImgFrame::Type::YUV420p ||
-               video->getData().size() != static_cast<std::size_t>(recordingWidth_)*recordingHeight_*3/2)
-                throw std::runtime_error("invalid recording YUV frame dimensions or payload");
-            result.recordingYuv = std::make_shared<const std::vector<std::uint8_t>>(std::move(video->getData()));
+        // Preserve every encoded entry in arrival order. Taking only the latest
+        // packet would discard frames and corrupt H264 reference dependencies.
+        if(auto video = recordingQueue_->tryGet<dai::ImgFrame>()) {
+            if(video->getType() != dai::ImgFrame::Type::BITSTREAM || video->getData().empty() ||
+               video->getData().size() > static_cast<std::size_t>(recordingEncodedWidth_) * recordingEncodedHeight_ * 3 + 65536)
+                throw std::runtime_error("invalid device-encoded recording payload");
+            result.recordingEncoded = std::make_shared<const std::vector<std::uint8_t>>(std::move(video->getData()));
+            if(info_.recordingEncoding == OakRecordingEncoding::H264)
+                result.recordingEncoded = h264Headers_.prepare(std::move(result.recordingEncoded));
             result.recordingAt = video->getTimestamp();
+            result.recordingSequence = video->getSequenceNum();
         }
         if(frame) {
             const int w = frame->getWidth(), h = frame->getHeight();
-            if(w < 1 || h < 1 || frame->getData().size() != static_cast<std::size_t>(w)*h*3)
+            if(w < 1 || h < 1 || w % 2 || h % 2 || frame->getType() != dai::ImgFrame::Type::YUV420p ||
+               frame->getData().size() != static_cast<std::size_t>(w)*h*3/2)
                 throw std::runtime_error("invalid preview frame");
-            std::vector<cv::Mat> planes;
-            for(int n = 0; n < 3; ++n) planes.emplace_back(h,w,CV_8UC1,frame->getData().data()+n*w*h);
-            cv::merge(planes, result.preview);
+            cv::cvtColor(cv::Mat(h*3/2,w,CV_8UC1,frame->getData().data()), result.preview, cv::COLOR_YUV2BGR_I420);
         }
-        if(!frame && !result.nativeYuv && !result.recordingYuv && result.depthMillimeters.empty() &&
+        if(!frame && !result.nativeYuv && !result.recordingEncoded && result.depthMillimeters.empty() &&
            result.healthAt == std::chrono::steady_clock::time_point{}) std::this_thread::sleep_for(std::chrono::milliseconds(2));
         return result;
     }
@@ -229,7 +313,10 @@ private:
     std::vector<std::uint8_t> rgbDemand_;
     bool depthDemand_ = false;
     int recordingWidth_ = 0, recordingHeight_ = 0;
+    int recordingEncodedWidth_ = 0;
+    int recordingEncodedHeight_ = 0;
     OakCaptureInfo info_;
+    OakH264Headers h264Headers_;
 };
 }
 

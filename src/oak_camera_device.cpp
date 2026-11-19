@@ -1,4 +1,5 @@
 #include "oak_camera_device.h"
+#include "oak_preview_worker.h"
 
 #include <chrono>
 #include <ctime>
@@ -79,7 +80,12 @@ Json::Value OakCameraDevice::capabilities() const {
     v["native"]["minFps"] = captureInfo_.minFps; v["native"]["maxFps"] = captureInfo_.maxFps;
     v["sensorMode"] = "native"; v["resizeMode"] = "fit_with_black_bars";
     v["photoFpsMeaning"] = "native_photo_buffer_refresh_rate_not_continuous_file_saving";
-    v["recordingCodec"] = "h264"; v["recordingContainer"] = "mp4";
+    const auto encoding = captureInfo_.recordingEncoding;
+    v["recordingCodec"] = encoding == OakRecordingEncoding::Mjpeg || encoding == OakRecordingEncoding::MjpegRotated ? "mjpeg" : "h264";
+    v["recordingContainer"] = encoding == OakRecordingEncoding::MjpegRotated ? "mov" :
+        encoding == OakRecordingEncoding::Mjpeg ? "matroska" : "mp4";
+    v["recordingDisplayRotation"] = encoding == OakRecordingEncoding::MjpegRotated ? 90 : 0;
+    v["recordingEncoder"] = captureInfo_.recordingEncoding == OakRecordingEncoding::Yuv420p ? "host_libx264" : "oak_hardware";
     v["minimumOutputFps"] = 1; v["previewMaxWidth"] = 1920; v["previewMaxHeight"] = 1080;
     v["depth"] = depthStatusLocked();
     v["resolutions"] = Json::Value(Json::arrayValue);
@@ -260,10 +266,13 @@ OakStatus OakCameraDevice::startRecording() {
         }
         info = captureInfo_;
         recording = activeSettings_.recording;
-        outputPath = config_.recordingDir / ("oak_record_" + makeTimestamp() + ".mp4");
+        outputPath = config_.recordingDir / ("oak_record_" + makeTimestamp() +
+            (info.recordingEncoding == OakRecordingEncoding::MjpegRotated ? ".mov" :
+             info.recordingEncoding == OakRecordingEncoding::Mjpeg ? ".mkv" : ".mp4"));
     }
     try { writer_.start(outputPath, recording.width ? recording.width : info.nativeWidth,
-                       recording.height ? recording.height : info.nativeHeight, recording.fps, config_.recordingCrf); }
+                       recording.height ? recording.height : info.nativeHeight, recording.fps, config_.recordingCrf,
+                       info.recordingEncoding); }
     catch(const std::exception& e) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto result = currentStatusLocked(); result.success = false;
@@ -276,16 +285,22 @@ OakStatus OakCameraDevice::startRecording() {
         return result;
     }
     recordingDemandStarted_ = std::chrono::steady_clock::now();
+    lastRecordingEncoding_ = info.recordingEncoding;
     recording_ = true; lastRecordingPath_ = outputPath.string(); lastMessage_ = "recording started";
     // No recording transport is enabled before the writer is ready. The first
     // newly requested frame is submitted by the capture thread before success.
-    frameCv_.wait_for(lock, std::chrono::milliseconds(std::min(config_.noFrameTimeoutMs + 250, 1500)), [&] {
-        return !running_.load() || !cameraConnected_ || lastRecordingFrameTime_ >= recordingDemandStarted_;
-    });
-    if(!hasFreshCaptureLocked() || lastRecordingFrameTime_ < recordingDemandStarted_) {
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(std::min(config_.noFrameTimeoutMs + 250, 2500));
+    // A hardware stream can resume mid-GOP. Wait for a decodable keyframe to
+    // reach the muxer before acknowledging start, rather than its first packet.
+    while(running_.load() && cameraConnected_ && writer_.stats().active &&
+          writer_.stats().frames == 0 && std::chrono::steady_clock::now() < deadline)
+        frameCv_.wait_for(lock, std::chrono::milliseconds(20));
+    if(!hasFreshCaptureLocked() || writer_.stats().frames == 0 || !writer_.stats().active) {
         recording_ = false;
         lock.unlock(); writer_.stop(); lock.lock();
-        auto result = currentStatusLocked(); result.success = false; result.message = "timed out waiting for the first recording frame";
+        auto result = currentStatusLocked(); result.success = false;
+        result.message = "no decodable recording frame committed: " + result.lastRecordingError;
         return result;
     }
     auto result = currentStatusLocked(); result.success = true; result.path = lastRecordingPath_;
@@ -432,11 +447,29 @@ void OakCameraDevice::runCaptureLoop() {
             auto healthySince = lastValidFrame;
             bool seenFrame = false;
             bool seenPreview = false, seenNative = false, seenRecording = false, seenHealth = false;
+            std::atomic<bool> previewReady{false};
+            OakPreviewWorker previewWorker([&, this](const cv::Mat& image, auto stamp) {
+                auto jpeg = encodeJpeg(image);
+                if(jpeg.empty()) throw std::runtime_error("JPEG encoding produced no frame");
+                std::lock_guard<std::mutex> lock(mutex_);
+                if(!running_.load() || revision != settingsRevision_) return;
+                latestJpeg_ = std::move(jpeg);
+                lastFrameTime_ = stamp;
+                ++frameId_;
+                previewReady.store(true);
+                frameCv_.notify_all();
+            });
             while(running_.load()) {
+                previewWorker.check();
                 bool depthDemand;
                 OakRgbDemand rgbDemand;
                 {
                     std::lock_guard<std::mutex> lock(mutex_); if(reconfigure_) break;
+                    if(recording_ && !writer_.stats().active) {
+                        recording_ = false;
+                        lastMessage_ = "recording ended: " + writer_.stats().error;
+                        frameCv_.notify_all();
+                    }
                     const auto now = std::chrono::steady_clock::now();
                     depthDemand = config_.depthEnabled && now < depthDemandUntil_;
                     rgbDemand = {!seenPreview || now < previewDemandUntil_, !seenNative || nativeDemand_,
@@ -478,19 +511,30 @@ void OakCameraDevice::runCaptureLoop() {
                         frameCv_.notify_all();
                     }
                 }
-                if(captured.recordingYuv) {
+                if(captured.recordingYuv || captured.recordingEncoded) {
+                    if(captured.recordingEncoded && (captured.recordingAt == std::chrono::steady_clock::time_point{} ||
+                       captured.recordingAt > now))
+                        throw std::runtime_error("invalid device-encoded recording timestamp");
                     if(captured.recordingAt == std::chrono::steady_clock::time_point{}) captured.recordingAt = now;
-                    if(captured.recordingAt <= now && now-captured.recordingAt <= freshness(config_.frameFreshnessMs, sourceConfig.media.recording.fps)) {
+                    // Encoded H264 packets are ordered references. Discarding an
+                    // older packet here would corrupt subsequent valid frames.
+                    if(captured.recordingAt <= now && (captured.recordingEncoded ||
+                       now-captured.recordingAt <= freshness(config_.frameFreshnessMs, sourceConfig.media.recording.fps))) {
                     lastValidRecording = now; seenRecording = true;
                     const auto& r = sourceConfig.media.recording;
                     const int w = r.width ? r.width : info.nativeWidth, h = r.height ? r.height : info.nativeHeight;
-                    if(captured.recordingYuv->size() != static_cast<std::size_t>(w)*h*3/2)
+                    if(info.recordingEncoding == OakRecordingEncoding::Yuv420p &&
+                       (!captured.recordingYuv || captured.recordingYuv->size() != static_cast<std::size_t>(w)*h*3/2))
                         throw std::runtime_error("recording YUV dimensions do not match applied settings");
+                    if(info.recordingEncoding != OakRecordingEncoding::Yuv420p &&
+                       (!captured.recordingEncoded || captured.recordingEncoded->empty()))
+                        throw std::runtime_error("recording encoded payload is empty");
                     std::lock_guard<std::mutex> lock(mutex_);
                     if(revision != settingsRevision_) break;
                     lastRecordingFrameTime_ = captured.recordingAt;
                     if(recording_ && captured.recordingAt >= recordingDemandStarted_)
-                        writer_.submit(std::move(captured.recordingYuv), captured.recordingAt);
+                        writer_.submit(info.recordingEncoding == OakRecordingEncoding::Yuv420p ?
+                            std::move(captured.recordingYuv) : std::move(captured.recordingEncoded), captured.recordingAt);
                     frameCv_.notify_all();
                     }
                 }
@@ -499,18 +543,8 @@ void OakCameraDevice::runCaptureLoop() {
                    image.rows != sourceConfig.media.preview.height) {
                     throw std::runtime_error("invalid BGR preview image");
                 }
-                auto jpeg = encodeJpeg(image);
-                if(jpeg.empty()) throw std::runtime_error("JPEG encoding produced no frame");
+                previewWorker.submit(image, now);
                 lastValidFrame = now; seenPreview = true;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if(!running_.load()) break;
-                    if(revision != settingsRevision_) break;
-                    latestJpeg_ = std::move(jpeg);
-                    lastFrameTime_ = now;
-                    ++frameId_;
-                    frameCv_.notify_all();
-                }
                 }
                 // Idle outputs are intentionally silent. Only a demanded stream
                 // has a stall deadline; the tiny real sensor health stream is
@@ -526,7 +560,7 @@ void OakCameraDevice::runCaptureLoop() {
                     throw std::runtime_error("native capture stalled: no valid new frame within timeout");
                 if(now-lastValidRecording >= std::chrono::milliseconds(config_.noFrameTimeoutMs))
                     throw std::runtime_error("recording source stalled: no valid new frame within timeout");
-                const bool connected = seenHealth && seenPreview && seenNative && seenRecording;
+                const bool connected = seenHealth && seenPreview && previewReady.load() && seenNative && seenRecording;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if(!running_.load() || revision != settingsRevision_) break;
@@ -677,6 +711,12 @@ OakStatus OakCameraDevice::currentStatusLocked() const {
     status.recordingDroppedFrames = media.dropped;
     status.lastRecordingError = media.error;
     status.recordingActualFps = media.actualFps;
+    const auto encoding = lastRecordingEncoding_.value_or(captureInfo_.recordingEncoding);
+    status.recordingCodec = encoding == OakRecordingEncoding::Mjpeg || encoding == OakRecordingEncoding::MjpegRotated ? "mjpeg" : "h264";
+    status.recordingContainer = encoding == OakRecordingEncoding::MjpegRotated ? "mov" :
+        encoding == OakRecordingEncoding::Mjpeg ? "matroska" : "mp4";
+    status.recordingDisplayRotation = encoding == OakRecordingEncoding::MjpegRotated ? 90 : 0;
+    status.recordingEncoder = encoding == OakRecordingEncoding::Yuv420p ? "host_libx264" : "oak_hardware";
     status.sensorName = captureInfo_.sensorName;
     status.nativeWidth = captureInfo_.nativeWidth;
     status.nativeHeight = captureInfo_.nativeHeight;
@@ -769,7 +809,10 @@ std::string oakStatusToJson(const OakStatus& status) {
         << "\"nativeHeight\":" << status.nativeHeight << ","
         << "\"captureJpegQuality\":" << status.captureJpegQuality << ","
         << "\"recordingCrf\":" << status.recordingCrf << ","
-        << "\"recordingCodec\":\"h264\",\"recordingContainer\":\"mp4\","
+        << "\"recordingCodec\":\"" << status.recordingCodec << "\","
+        << "\"recordingContainer\":\"" << status.recordingContainer << "\","
+        << "\"recordingDisplayRotation\":" << status.recordingDisplayRotation << ","
+        << "\"recordingEncoder\":\"" << status.recordingEncoder << "\","
         << "\"lastNativeFrameAgeMs\":" << status.lastNativeFrameAgeMs << ","
         << "\"nativeFrameId\":" << status.nativeFrameId << ","
         << "\"recordingFrames\":" << status.recordingFrames << ","

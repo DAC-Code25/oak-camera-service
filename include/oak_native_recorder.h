@@ -1,5 +1,7 @@
 #pragma once
 
+#include "oak_recording_encoding.h"
+
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -20,8 +22,11 @@ class OakNativeRecorder {
 public:
     OakNativeRecorder();
     ~OakNativeRecorder();
-    void start(const std::filesystem::path& path, int width, int height, float fps, int crf);
-    void submit(std::shared_ptr<const std::vector<std::uint8_t>> yuv, std::chrono::steady_clock::time_point timestamp);
+    // Width/height describe the upright output. MjpegRotated input JPEGs have
+    // swapped coded dimensions; the MOV display matrix restores orientation.
+    void start(const std::filesystem::path& path, int width, int height, float fps, int crf,
+               OakRecordingEncoding encoding = OakRecordingEncoding::Yuv420p);
+    void submit(std::shared_ptr<const std::vector<std::uint8_t>> bytes, std::chrono::steady_clock::time_point timestamp);
     OakRecordingStats stop();
     OakRecordingStats stats() const;
 private:

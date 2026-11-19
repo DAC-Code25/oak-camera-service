@@ -141,7 +141,8 @@ class DeployTransactionTest(unittest.TestCase):
             with deployment.deployment_lock(Path(directory)):
                 pass
 
-    def exercise(self, low_fps=False, active_recording=False, unknown_drop=False, readiness_only=False):
+    def exercise(self, low_fps=False, active_recording=False, unknown_drop=False, readiness_only=False,
+                 low_fps_frames=200):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root/'.tenco-project.json').write_text('{}')
@@ -178,7 +179,7 @@ class DeployTransactionTest(unittest.TestCase):
                     if 'test-photo.jpg' in command:
                         return json.dumps({'streams':[{'width':4056,'height':3040}]}).encode()
                     return json.dumps({'streams':[{'width':1280,'height':720,'codec_name':'h264',
-                        'nb_read_frames':'200' if low_fps else '540','duration':'20'}]}).encode()
+                        'nb_read_frames':str(low_fps_frames) if low_fps else '600','duration':'20'}]}).encode()
                 raise AssertionError(command)
 
             def request(path='/camera/status', method='GET'):
@@ -226,6 +227,8 @@ class DeployTransactionTest(unittest.TestCase):
 
     def test_success_removes_transaction_backup(self): self.exercise()
     def test_fps_failure_restores_binary_dropin_and_settings(self): self.exercise(low_fps=True)
+    def test_27fps_no_longer_passes_default_720p_acceptance(self):
+        self.exercise(low_fps=True, low_fps_frames=540)
     def test_active_recording_prevents_mutation(self): self.exercise(active_recording=True)
     def test_unknown_dropin_is_preserved_before_mutation(self): self.exercise(unknown_drop=True)
     def test_readiness_only_uses_shared_transaction_without_media(self): self.exercise(readiness_only=True)

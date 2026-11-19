@@ -226,12 +226,12 @@ def validate_media(evidence):
     if not stop.get('success') or stop.get('lastRecordingError'):
         raise RuntimeError('recording failed: '+str(stop))
     video = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-count_frames',
-        '-show_streams', '-show_format', '-of', 'json', stop['path']]))
+        '-show_streams', '-show_format', '-of', 'json', stop['path']], timeout=90))
     stream = video['streams'][0]
     fps = int(stream['nb_read_frames'])/float(stream['duration'])
-    if (stream['width'],stream['height'],stream['codec_name']) != (1280,720,'h264') or fps < 15:
-        raise RuntimeError('saved default media failed >=15 FPS/dimension/codec validation: '+str(video))
-    subprocess.run(['ffmpeg','-v','error','-xerror','-i',stop['path'],'-f','null','-'],check=True)
+    if (stream['width'],stream['height'],stream['codec_name']) != (1280,720,'h264') or fps < 29.7:
+        raise RuntimeError('saved default media failed 30 FPS (1% clock tolerance)/dimension/codec validation: '+str(video))
+    subprocess.run(['ffmpeg','-v','error','-xerror','-i',stop['path'],'-f','null','-'],check=True,timeout=90)
     photo_info = json.loads(subprocess.check_output(['ffprobe','-v','error','-show_streams','-of','json',photo['path']]))['streams'][0]
     native = evidence['capabilities']['native']
     if (photo_info['width'],photo_info['height']) != (native['width'],native['height']):
